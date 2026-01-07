@@ -232,13 +232,14 @@ if __name__ == "__main__":
     print(f"\nLoading model: {model_architecture}")
     model = prepare_models.get_model(model_architecture, dataset, num_classes, input_size)
     
-    model_path = os.path.join(model_dir, dataset, f"{model_architecture}.pth")
-    print(f"Model path: {model_path}")
-    
-    # Load model weights
-    checkpoint = torch.load(model_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
+    if dataset != 'imagenet':
+        model_path = os.path.join(model_dir, dataset, f"{model_architecture}.pth")
+        print(f"Model path: {model_path}")
+        
+        # Load model weights
+        checkpoint = torch.load(model_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+
     # Wrap model for feature extraction
     print("\nWrapping model for feature extraction...")
     model = FeatureExtractorWrapper(model, model_architecture)
