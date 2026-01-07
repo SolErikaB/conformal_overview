@@ -1,6 +1,6 @@
 """
-Reproducible fine-tuning of ImageNet pretrained models on CIFAR-10, CIFAR-100, and Fashion-MNIST
-Saves trained models to /project for post-processing benchmarking
+Script which fine-tunes ImageNet pretrained models on CIFAR-10, CIFAR-100, and Fashion-MNIST,
+or simply loads the ImageNet model for ImageNet (2012) classification. 
 """
 
 import torch
@@ -77,6 +77,23 @@ def get_transforms(dataset_name):
             transforms.Normalize(mean=[0.5, 0.5, 0.5], 
                                std=[0.5, 0.5, 0.5])
         ])
+
+    elif dataset_name == 'imagenet':
+        # ImageNet normalization - CRITICAL for pretrained models!
+        transform_train = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                            std=[0.229, 0.224, 0.225])
+        ])
+        transform_val = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                            std=[0.229, 0.224, 0.225])
+        ])
     
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
@@ -150,6 +167,21 @@ def get_datasets(dataset_name, data_root, seed):
 
         num_classes = 10
         input_size = 28
+
+    elif dataset_name == 'imagenet':
+        # ImageNet: 224x224 RGB images, 1000 classes
+        # This requires downloading the ImageNet 2012 dataset separately
+        train_set = None
+        val_set = datasets.ImageNet(
+            root=data_root,
+            split="val",
+            transform=transform_val
+        )
+
+        test_set = val_set
+        
+        num_classes = 1000
+        input_size = 224  # Standard for ImageNet
     
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
@@ -161,20 +193,23 @@ def get_model(arch_name, dataset_name, num_classes, input_size):
     
     if arch_name == 'resnet18':
         base_model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        base_model.fc = nn.Linear(base_model.fc.in_features, num_classes)
+        # Only replace classifier if NOT ImageNet
+        if dataset_name != 'imagenet':
+            base_model.fc = nn.Linear(base_model.fc.in_features, num_classes)
         
     elif arch_name == 'resnet50':
         base_model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-        base_model.fc = nn.Linear(base_model.fc.in_features, num_classes)
+        if dataset_name != 'imagenet':
+            base_model.fc = nn.Linear(base_model.fc.in_features, num_classes)
         
     elif arch_name == 'efficientnet_b0':
         base_model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
-        in_features = base_model.classifier[1].in_features
-        # EfficientNet already has dropout, just replace final layer
-        base_model.classifier = nn.Sequential(
-            nn.Dropout(p=0.2),
-            nn.Linear(in_features, num_classes)
-        )
+        if dataset_name != 'imagenet':
+            in_features = base_model.classifier[1].in_features
+            base_model.classifier = nn.Sequential(
+                nn.Dropout(p=0.2),
+                nn.Linear(in_features, num_classes)
+            )
     
     else:
         raise ValueError(f"Unknown architecture: {arch_name}")
