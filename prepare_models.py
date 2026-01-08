@@ -173,7 +173,7 @@ def get_datasets(dataset_name, data_root, seed):
         # This requires downloading the ImageNet 2012 dataset separately
         train_set = None
         val_set = datasets.ImageNet(
-            root=data_root,
+            root=os.path.join(data_root, 'imagenet'),
             split="val",
             transform=transform_val
         )
