@@ -30,23 +30,17 @@ class FeatureExtractorWrapper(nn.Module):
             # ResNet structure: conv1, bn1, relu, maxpool, layer1, layer2, layer3, layer4, avgpool, fc
             children = list(base_model.children())
             
-            # Features up to layer4 (second-to-last feature layer)
-            self.features_early = nn.Sequential(*children[:-2])  # Up to layer4
-            self.features_late = children[-2]  # avgpool
+            # Features up to layer3 (second-to-last feature layer)
+            self.features = nn.Sequential(*children[:-1])
             self.classifier = children[-1]  # fc
             
         elif 'efficientnet' in arch_name:
             # EfficientNet structure: features (Sequential), avgpool, classifier
             children = list(base_model.children())
-            
-            # The features module contains all conv blocks
-            feature_blocks = list(children[0].children())
-            
-            # Split: all blocks except last, then last block
-            self.features_early = nn.Sequential(*feature_blocks[:-1])
-            self.features_last_block = feature_blocks[-1]
-            self.features_late = children[1]  # avgpool
-            self.classifier = children[2]  # classifier
+
+            # Features up to and including avgpool
+            self.features = nn.Sequential(*children[:-1])
+            self.classifier = children[-1]  # classifier
             
         else:
             raise ValueError(f"Unsupported architecture: {arch_name}")
@@ -55,32 +49,16 @@ class FeatureExtractorWrapper(nn.Module):
         # Apply upsample if needed
         if self.has_upsample:
             x = self.upsample(x)
-        
-        # Extract features from second-to-last layer
-        if 'resnet' in self.arch_name:
-            feat_early = self.features_early(x)  # After layer4
-            feat_late = self.features_late(feat_early)  # After avgpool
-            feat_late = feat_late.flatten(1)
+
+        # Extract features
+        features = self.features(x)
+        features = torch.flatten(features, 1)
             
-            # Also flatten the early features for consistency
-            feat_early = torch.nn.functional.adaptive_avg_pool2d(feat_early, (1, 1))
-            feat_early = feat_early.flatten(1)
-            
-        elif 'efficientnet' in self.arch_name:
-            feat_early = self.features_early(x)
-            feat_early = self.features_last_block(feat_early)  # After last conv block
-            feat_late = self.features_late(feat_early)  # After avgpool
-            feat_late = feat_late.flatten(1)
-            
-            # Flatten early features
-            feat_early = torch.nn.functional.adaptive_avg_pool2d(feat_early, (1, 1))
-            feat_early = feat_early.flatten(1)
-        
         # Get logits
-        logits = self.classifier(feat_late)
+        logits = self.classifier(features)
         
         if return_features:
-            return logits, feat_early, feat_late
+            return logits, features
         return logits
 
 
@@ -89,15 +67,14 @@ def evaluate_model(model, test_loader, device):
     Evaluate model on test set and extract all outputs.
     
     Returns:
-        dict with keys: 'logits', 'probabilities', 'features_penultimate', 
-                       'features_pre_penultimate', 'labels', 'predictions'
+        dict with keys: 'logits', 'probabilities', 'features',
+                       'labels', 'predictions'
     """
     model.eval()
     
     all_logits = []
     all_probs = []
-    all_features_early = []
-    all_features_late = []
+    all_features = []
     all_labels = []
     
     with torch.no_grad():
@@ -105,7 +82,7 @@ def evaluate_model(model, test_loader, device):
             images = images.to(device)
             
             # Get logits and features from both layers
-            logits, features_early, features_late = model(images, return_features=True)
+            logits, features = model(images, return_features=True)
             
             # Compute probabilities (softmax of logits)
             probs = torch.softmax(logits, dim=1)
@@ -113,16 +90,14 @@ def evaluate_model(model, test_loader, device):
             # Store results
             all_logits.append(logits.cpu().numpy())
             all_probs.append(probs.cpu().numpy())
-            all_features_early.append(features_early.cpu().numpy())
-            all_features_late.append(features_late.cpu().numpy())
+            all_features.append(features.cpu().numpy())
             all_labels.append(labels.numpy())
     
     # Concatenate all batches
     results = {
         'logits': np.concatenate(all_logits, axis=0),
         'probabilities': np.concatenate(all_probs, axis=0),
-        'features_pre_penultimate': np.concatenate(all_features_early, axis=0),
-        'features_penultimate': np.concatenate(all_features_late, axis=0),
+        'features': np.concatenate(all_features, axis=0),
         'labels': np.concatenate(all_labels, axis=0),
     }
     
@@ -142,8 +117,7 @@ def save_results(results, save_dir, dataset, model_architecture):
         save_path,
         logits=results['logits'],
         probabilities=results['probabilities'],
-        features_pre_penultimate=results['features_pre_penultimate'],
-        features_penultimate=results['features_penultimate'],
+        features=results['features'],
         labels=results['labels'],
         predictions=results['predictions']
     )
@@ -151,8 +125,7 @@ def save_results(results, save_dir, dataset, model_architecture):
     print(f"\nSaved outputs to: {save_path}")
     print(f"  - Logits shape: {results['logits'].shape}")
     print(f"  - Probabilities shape: {results['probabilities'].shape}")
-    print(f"  - Pre-penultimate features shape: {results['features_pre_penultimate'].shape}")
-    print(f"  - Penultimate features shape: {results['features_penultimate'].shape}")
+    print(f"  - Features shape: {results['features'].shape}")
     print(f"  - Labels shape: {results['labels'].shape}")
     
     return save_path
@@ -163,33 +136,23 @@ def compute_metrics(results):
     predictions = results['predictions']
     labels = results['labels']
     
-    # Overall accuracy
-    accuracy = (predictions == labels).mean()
-    
-    # Per-class accuracy
-    num_classes = results['logits'].shape[1]
-    per_class_acc = []
-    for c in range(num_classes):
-        mask = labels == c
-        if mask.sum() > 0:
-            class_acc = (predictions[mask] == c).mean()
-            per_class_acc.append(class_acc)
+    # Top 1 and top 5 accuracy
+    top_1_accuracy = (predictions == labels).mean()
+    top_5_accuracy = np.mean([
+        labels[i] in np.argsort(results['logits'][i])[-5:] for i in range(len(labels))
+    ])
     
     print("\n" + "="*50)
     print("EVALUATION METRICS")
     print("="*50)
-    print(f"Overall Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
-    print(f"Number of samples: {len(labels)}")
-    print(f"Number of classes: {num_classes}")
-    print(f"Mean per-class accuracy: {np.mean(per_class_acc):.4f}")
-    print(f"Pre-penultimate feature dimension: {results['features_pre_penultimate'].shape[1]}")
-    print(f"Penultimate feature dimension: {results['features_penultimate'].shape[1]}")
+    print(f"Top 1 Accuracy: {top_1_accuracy:.4f} ({top_1_accuracy*100:.2f}%)")
+    print(f"Top 5 Accuracy: {top_5_accuracy:.4f} ({top_5_accuracy*100:.2f}%)")
+    print(f"Features shape: {results['features'].shape}")
     print("="*50)
     
     return {
-        'accuracy': accuracy,
-        'per_class_accuracy': per_class_acc,
-        'mean_per_class_accuracy': np.mean(per_class_acc)
+        'top_1_accuracy': top_1_accuracy,
+        'top_5_accuracy': top_5_accuracy,
     }
 
 
