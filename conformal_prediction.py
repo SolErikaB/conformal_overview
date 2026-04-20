@@ -8,6 +8,7 @@ import prepare_models
 from model_eval_and_save_features import FeatureExtractorWrapper
 import torch
 from sklearn.cluster import KMeans
+from sklearn.metrics import pairwise_distances
 
 with open("config.yaml", 'r') as f:
         config = yaml.safe_load(f)
@@ -67,19 +68,45 @@ class MarginDistanceScore(DistanceMetric):
     def __init__(self, distance_metric, n_classes):
         super().__init__(distance_metric)
         self.n_classes = n_classes
+        self.distance_metric = distance_metric
 
     def compute_score(self, datapoint, label):
         
         current_pred = np.argmax(datapoint)
 
-        if current_pred == label:
-            distances = [abs(datapoint[label] - datapoint[i])
-                        for i in range(len(datapoint)) if i != label]
-            distance = -min(distances)
-        else:
-            distance = datapoint[current_pred] - datapoint[label]
+        if self.distance_metric == 'euclidean':
+            if current_pred == label:
+                distances = [abs(datapoint[label] - datapoint[i])
+                            for i in range(len(datapoint)) if i != label]
+                distance = -min(distances)
+            else:
+                distance = datapoint[current_pred] - datapoint[label]
 
-        return distance
+            return distance
+
+        elif self.distance_metric == 'cosine':
+            # Find the largest element not equal to the label
+
+                z = np.argmax(datapoint)
+                if z == label:
+                    z = np.argsort(datapoint)[-2]  # second largest if largest is label
+
+                pi_y = datapoint[label]
+                pi_z = datapoint[z]
+
+                a = (pi_y + pi_z) / 2
+
+                b = datapoint.copy()
+                b[label] = a
+                b[z] = a
+
+                distance = 1-np.linalg.norm(b)/np.linalg.norm(datapoint)
+
+                if current_pred == label:
+                    return -abs(distance)
+                else:
+                    return abs(distance)
+            
 
 
 class MeanDistanceScore(DistanceMetric):
@@ -113,7 +140,7 @@ class MeanDistanceScore(DistanceMetric):
             self.class_sizes.append(len(class_data))
             self.class_means.append(np.mean(class_data, axis=0))
     
-    def compute_score(self, datapoint, label, exclude_datapoint=False):
+    def compute_score(self, datapoint, label, exclude_datapoint=False, idx=None):
         """Compute distance to class mean, optionally excluding the datapoint.
         
         Args:
@@ -176,7 +203,6 @@ class KMeans3DistanceScore(DistanceMetric):
             return min(distances)
 
 
-
 class RAPS(DistanceMetric):
     """Nonconformity score using Regularized Adaptive Prediction Sets."""
     
@@ -187,23 +213,18 @@ class RAPS(DistanceMetric):
         self.reg_lambda = reg_lambda
 
     def compute_score(self, datapoint, label):
+
+        target = datapoint[label]
+
+        mask = datapoint > target
+
+        r = np.sum(mask) + 1
+
+        E = np.sum(datapoint[mask]) if r > 1 else 0
         
-        sorted_indices = np.argsort(-datapoint)  # descending order
-        sorted_scores = datapoint[sorted_indices]
-
-        c = np.cumsum(sorted_scores)
-
-        r = np.where(sorted_indices == label)[0][0] + 1 # rank of label
-
-        if r==1: E=0
-        else: E = c[r-2] # cumulative sum up until (not including) label
-
-        u = np.random.uniform(0, 1)
-        #u = 0.5
+        u = 0.001
         score = E + u * datapoint[label] + self.reg_lambda * max(r-self.reg_k,0)
 
-#        if r<=2:
-#            print(E, datapoint[label], r, max(r-self.reg_k,0), score)
         return score
 
 
@@ -216,21 +237,22 @@ class SAPS(DistanceMetric):
         self.reg_lambda = reg_lambda
 
     def compute_score(self, datapoint, label):
-        
-        sorted_indices = np.argsort(-datapoint)  # descending order
+
+        target = datapoint[label]
+
+        r = np.sum(datapoint > target) + 1
         biggest_score = np.max(datapoint)
 
-        r = np.where(sorted_indices == label)[0][0] + 1 # rank of label
+        u = 0.001
 
-        u = np.random.uniform(0, 1)
+        if r == 1:
+            E = u * biggest_score
+        else:
+            E = biggest_score
 
-        if r==1: E = u*biggest_score
-        else: E = biggest_score
-
-        score = E + self.reg_lambda * (r-2+u)
+        score = E + self.reg_lambda * (r - 2 + u)
 
         return score
-
 
 
 
@@ -244,6 +266,7 @@ class GradientDistanceScore(DistanceMetric):
         self.n_classes = n_classes
 
         dataset = config['conformal_prediction']['dataset']
+        dataset = 'cifar10'
         model_architecture = config['conformal_prediction']['model_architecture']
         data_dir = config['training']['data_directory']
         model_dir = config['training']['model_directory']
@@ -332,11 +355,18 @@ class FastGradientDistanceScore(DistanceMetric):
         model_dir = config['training']['model_directory']
         #self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.device = torch.device('cpu')
+
+        if dataset.endswith("_imbalanced"):
+            dataset = dataset[:-11]
+
         _, _, _, num_classes, input_size = prepare_models.get_datasets(dataset, data_dir, seed=123)
 
         # Load model
         model = prepare_models.get_model(model_architecture, dataset, num_classes, input_size)
         model_path = os.path.join(model_dir, dataset, f"{model_architecture}.pth")
+
+        
+
         if dataset != 'imagenet':
             checkpoint = torch.load(model_path, map_location=self.device)
             model.load_state_dict(checkpoint['model_state_dict'])
@@ -565,9 +595,6 @@ class ConformalPrediction(NonconformityScore):
         for class_ in range(self.n_classes):
 
             non_conformity_score = self.nonconformity_score.compute_score(data_point, class_)
-
-            #if class_==label and np.argmax(data_point)!=label:
-                #print(class_, non_conformity_score, self.thresholds[class_], data_point[class_])
 
             if non_conformity_score <= self.thresholds[class_]:
                 prediction_region.append(class_)

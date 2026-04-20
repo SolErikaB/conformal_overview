@@ -3,6 +3,7 @@ Script which fine-tunes ImageNet pretrained models on CIFAR-10, CIFAR-100, and F
 or simply loads the ImageNet model for ImageNet (2012) classification. 
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -24,6 +25,76 @@ def set_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+def get_class_labels(dataset_or_subset):
+    """Extract all labels from a dataset or Subset/ConcatDataset."""
+    from torch.utils.data import Subset, ConcatDataset
+    
+    if isinstance(dataset_or_subset, Subset):
+        all_labels = np.array(dataset_or_subset.dataset.targets)
+        return all_labels[dataset_or_subset.indices], dataset_or_subset.indices
+    elif hasattr(dataset_or_subset, 'targets'):
+        labels = np.array(dataset_or_subset.targets)
+        return labels, np.arange(len(labels))
+    else:
+        raise ValueError(f"Cannot extract labels from {type(dataset_or_subset)}")
+
+
+def apply_class_imbalance(dataset_or_subset, minority_classes, keep_fraction=0.1, seed=42):
+    """
+    Remove 90% of examples from minority_classes.
+    Works on Subset or datasets with .targets.
+    Returns a new Subset with filtered indices.
+    """
+    from torch.utils.data import Subset
+    
+    labels, indices = get_class_labels(dataset_or_subset)
+    indices = np.array(indices)
+    
+    rng = np.random.default_rng(seed)
+    kept_indices = []
+    
+    for idx, label in zip(indices, labels):
+        if label in minority_classes:
+            # Keep only keep_fraction of minority class examples
+            # Use per-class deterministic sampling
+            kept_indices.append((idx, label, True))  # flag for sampling
+        else:
+            kept_indices.append((idx, label, False))
+    
+    final_indices = []
+    # Group minority class indices and subsample
+    minority_idx_by_class = {}
+    for idx, label, is_minority in kept_indices:
+        if is_minority:
+            minority_idx_by_class.setdefault(label, []).append(idx)
+        else:
+            final_indices.append(idx)
+    
+    for cls, cls_indices in minority_idx_by_class.items():
+        cls_indices = np.array(cls_indices)
+        n_keep = max(1, int(len(cls_indices) * keep_fraction))
+        chosen = rng.choice(cls_indices, size=n_keep, replace=False)
+        final_indices.extend(chosen.tolist())
+    
+    # Get the underlying base dataset
+    if isinstance(dataset_or_subset, Subset):
+        base_dataset = dataset_or_subset.dataset
+    else:
+        base_dataset = dataset_or_subset
+    
+    return Subset(base_dataset, final_indices)
+
+
+def apply_imbalance_to_concat(concat_dataset, minority_classes, keep_fraction=0.1, seed=42):
+    """Handle ConcatDataset by applying imbalance to each component."""
+    from torch.utils.data import ConcatDataset
+    
+    new_datasets = []
+    for i, ds in enumerate(concat_dataset.datasets):
+        new_ds = apply_class_imbalance(ds, minority_classes, keep_fraction, seed=seed + i)
+        new_datasets.append(new_ds)
+    return ConcatDataset(new_datasets)
 
 def get_transforms(dataset_name):
     """Get appropriate transforms for each dataset"""
@@ -100,7 +171,7 @@ def get_transforms(dataset_name):
     
     return transform_train, transform_val
 
-def get_datasets(dataset_name, data_root, seed):
+def get_datasets(dataset_name, data_root, seed, simulate_imbalance=False, keep_fraction=0.1):
     
     from torch.utils.data import ConcatDataset
     
@@ -185,6 +256,18 @@ def get_datasets(dataset_name, data_root, seed):
     
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
+
+    if simulate_imbalance and dataset_name != 'imagenet':
+        rng = np.random.default_rng(seed)
+        n_minority = max(1, int(num_classes * 0.10))          # 10% of classes
+        minority_classes = set(
+            rng.choice(num_classes, size=n_minority, replace=False).tolist()
+        )
+        print(f"[Imbalance] Minority classes ({n_minority}/{num_classes}): {sorted(minority_classes)}")
+        
+        train_set = apply_class_imbalance(train_set, minority_classes, keep_fraction=0.1, seed=seed)
+        val_set   = apply_class_imbalance(val_set,   minority_classes, keep_fraction=0.1, seed=seed)
+        test_set  = apply_imbalance_to_concat(test_set, minority_classes, keep_fraction=0.1, seed=seed)
     
     return train_set, val_set, test_set, num_classes, input_size
 
@@ -290,7 +373,7 @@ def train_model(arch_name, dataset_name, data_root, model_root, seed, epochs, ba
     print(f"Using device: {device}")
     
     # Load data
-    train_set, val_set, test_set, num_classes, input_size = get_datasets(dataset_name, data_root, seed)
+    train_set, val_set, test_set, num_classes, input_size = get_datasets(dataset_name, data_root, seed, simulate_imbalance=True, keep_fraction=0.1)
     
     train_loader = DataLoader(train_set, batch_size=batch_size, 
                             shuffle=True, num_workers=num_workers, 

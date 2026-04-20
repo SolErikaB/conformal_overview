@@ -112,7 +112,7 @@ def save_results(results, save_dir, dataset, model_architecture):
     os.makedirs(save_dir, exist_ok=True)
     
     # Save main results
-    save_path = os.path.join(save_dir, f"{dataset}_{model_architecture}_outputs.npz")
+    save_path = os.path.join(save_dir, f"{dataset}_imbalanced_{model_architecture}_outputs.npz")
     np.savez_compressed(
         save_path,
         logits=results['logits'],
@@ -177,23 +177,31 @@ if __name__ == "__main__":
     
     # Load test dataset
     print(f"\nLoading dataset: {dataset}")
-    _, _, test_set, num_classes, input_size = prepare_models.get_datasets(dataset, data_dir, seed)
+    _, _, test_set, num_classes, input_size = prepare_models.get_datasets(dataset, data_dir, seed, simulate_imbalance=False)
     print(f"Test set size: {len(test_set)}")
     print(f"Number of classes: {num_classes}")
     print(f"Input size: {input_size}")
+   
     
     # Create test dataloader
     test_loader = DataLoader(
         test_set,
-        batch_size=128,
+        batch_size=16,
         shuffle=False,
-        num_workers=4,
+        num_workers=1,
         pin_memory=True
     )
     
     # Load model
     print(f"\nLoading model: {model_architecture}")
     model = prepare_models.get_model(model_architecture, dataset, num_classes, input_size)
+    
+    import torchinfo
+    torchinfo.summary(
+    model,
+    input_size=(1, 3, 224, 224),
+    col_names=("input_size", "output_size", "num_params", "kernel_size", "mult_adds"),
+)
     
     if dataset != 'imagenet':
         model_path = os.path.join(model_dir, dataset, f"{model_architecture}.pth")
