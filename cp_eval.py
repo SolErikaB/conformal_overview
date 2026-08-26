@@ -55,25 +55,10 @@ class ConformalConfig:
             'test_labels': data_shuffled['labels'][self.n_calib:]
         }
 
-def run_cp_once(alpha, calibration_data, calibration_labels, calibration_preds, test_data, test_labels, n_classes, distance_metric, score_function, mondrian, reg_k, reg_lambda, parallel=False, n_workers=1):
-
-
-    # Multiprocessing to speed up prediction
-    # Split test data into chunks for each worker
-
-    
-    test_data_chunks = np.array_split(test_data, n_workers)
-    test_labels_chunks = np.array_split(test_labels, n_workers)
-
-    # Helper function to process each chunk
-    def process_chunk(i):
-        # Create a deep copy of the calibrated instance
-        cp_chunk = copy.deepcopy(cp)
-        cp_chunk.test_data = test_data_chunks[i]
-        cp_chunk.test_labels = test_labels_chunks[i]
-        
-        results_df_chunk = cp_chunk.predict()
-        return results_df_chunk
+def run_cp_once(alpha, calibration_data, calibration_labels, calibration_preds, test_data, test_labels,
+                 n_classes, distance_metric, score_function, mondrian, reg_k, reg_lambda,
+                 parallel=False, n_workers=1):
+    """Run conformal prediction for a single alpha value."""
 
     cp = ConformalPrediction(
         alpha=alpha,
@@ -89,81 +74,73 @@ def run_cp_once(alpha, calibration_data, calibration_labels, calibration_preds, 
         reg_k=reg_k,
         reg_lambda=reg_lambda
     )
+    cp.compute_scores()  # scores (calibration + test) computed once
 
-    cp.calibrate()
+    if not parallel or n_workers <= 1:
+        return cp.predict(alpha=alpha)
 
-    if parallel:
-        results_dfs = joblib.Parallel(n_jobs=n_workers)(
-            joblib.delayed(process_chunk)(i) for i in range(n_workers)
-        )
-        # Combine results from all workers
-        results_df = pd.concat(results_dfs, ignore_index=True)
-    else:
-        results_df = cp.predict()
+    # Parallel path: only useful if per-point compute_score() itself is the
+    # bottleneck (e.g. very large test sets). Thresholding is already cheap,
+    # so we parallelize by splitting the cached test_scores matrix, not by
+    # re-running compute_scores() per chunk.
+    test_score_chunks = np.array_split(cp._test_scores, n_workers)
+    test_label_chunks = np.array_split(np.asarray(test_labels), n_workers)
+    thresholds = np.array(cp._thresholds_for_alpha(alpha))
 
-    return results_df
+    def process_chunk(scores_chunk, labels_chunk):
+        mask = scores_chunk <= thresholds[None, :]
+        regions = [np.flatnonzero(row).tolist() for row in mask]
+        return pd.DataFrame({'label': labels_chunk, 'prediction_region': regions})
+
+    results_dfs = joblib.Parallel(n_jobs=n_workers)(
+        joblib.delayed(process_chunk)(test_score_chunks[i], test_label_chunks[i])
+        for i in range(n_workers)
+    )
+    return pd.concat(results_dfs, ignore_index=True)
 
 
-def find_I_single_iteration(alpha, calibration_data, calibration_labels, calibration_preds, test_data, test_labels, n_classes, distance_metric, score_function, mondrian, reg_k, reg_lambda, n_workers, top1_accuracy, top5_accuracy):
-    """P is the integral of the set size as a function of alpha. We can approximate it by computing the set sizes at different alphas and using the trapezoidal rule."""
+def find_I_single_iteration(alpha, calibration_data, calibration_labels, calibration_preds,
+                             test_data, test_labels, n_classes, distance_metric,
+                             score_function, mondrian, reg_k, reg_lambda, top1_accuracy):
+    """
+    I is the integral of set size over alpha, approximated via the trapezoidal rule.
+    Nonconformity scores are computed once; each alpha only redoes thresholding.
+    """
+    cp = ConformalPrediction(
+        alpha=alpha,
+        calibration_data=calibration_data,
+        calibration_labels=calibration_labels,
+        calibration_preds=calibration_preds,
+        test_data=test_data,
+        test_labels=test_labels,
+        n_classes=n_classes,
+        distance_metric=distance_metric,
+        score_function=score_function,
+        mondrian=mondrian,
+        reg_k=reg_k,
+        reg_lambda=reg_lambda
+    )
+    cp.compute_scores()
 
     values = []
+    for a in np.linspace(0.001, 1 - top1_accuracy, 50):
+        results_df = cp.predict(alpha=a)
+        evaluator = ConformalPredictionEvaluator(results_df, score_function, distance_metric, a, mondrian, n_classes)
+        _, avg_size = evaluator.get_accuracy()
+        values.append((a, avg_size))
 
-    for alpha in tqdm(np.linspace(0.001, 1-top1_accuracy, 50), desc="Calculating I value"):
-    #for alpha in np.linspace(0.001, 1-top1_accuracy, 50):
-
-        results_df = run_cp_once(
-            alpha,
-            calibration_data,
-            calibration_labels,
-            calibration_preds,
-            test_data,
-            test_labels,
-            n_classes,
-            distance_metric,
-            score_function,
-            mondrian,
-            reg_k,
-            reg_lambda,
-            parallel=False,
-            n_workers=1
-        )
-        evaluator = ConformalPredictionEvaluator(results_df, score_function, distance_metric, alpha, mondrian, n_classes)
-        coverage, avg_size = evaluator.get_accuracy()
-        sscv = evaluator.size_stratified_coverage_violation()
-
-        # Store (alpha, avg_size) pairs for trapezoidal rule calculation
-        values.append((alpha, avg_size, sscv))
-
-    # Calculate P using trapezoidal rule
-    I = 0
-    mean_sscv = 0
-    max_sscv = 0
-
-    for i in range(len(values)):
-        alpha1, size1, sscv = values[i]
-
-        if i+1<len(values):
-            alpha2, size2, _ = values[i + 1]
-        else:
-            break
-
+    I = 0.0
+    for i in range(len(values) - 1):
+        alpha1, size1 = values[i]
+        alpha2, size2 = values[i + 1]
         I += (alpha2 - alpha1) * (size1 + size2) / 2
 
-        mean_sscv += sscv
+    I /= (1 - top1_accuracy)
 
-        if sscv > max_sscv:
-            max_sscv = sscv
+    return I
 
-    mean_sscv /= len(values)
-    I /= (1-top1_accuracy)
-
-    #print(I)
-
-    return I, mean_sscv, max_sscv
 
 def create_I_table():
-
     columns = [
         'model_architecture',
         'dataset',
@@ -173,14 +150,9 @@ def create_I_table():
         'score_function',
         'distance_metric',
         'mondrian',
-        'SSCV_mean',
-        'SSCV_worst',
         'I_value',
     ]
-
-    I_df = pd.DataFrame(columns=columns)
-
-    return I_df
+    return pd.DataFrame(columns=columns)
 
 
 def compute_iteration(random_seed, conf_data):
@@ -188,9 +160,8 @@ def compute_iteration(random_seed, conf_data):
     Worker function that runs a single iteration with pre-loaded config data.
     conf_data is a dict containing all necessary config values (picklable).
     """
-    # Unpack config data
     alpha = conf_data['alpha']
-    data_arrays = conf_data['data_arrays']  # dict of plain numpy arrays
+    data_arrays = conf_data['data_arrays']
     n_classes = conf_data['n_classes']
     distance_metric = conf_data['distance_metric']
     score_function = conf_data['score_function']
@@ -198,15 +169,13 @@ def compute_iteration(random_seed, conf_data):
     reg_k = conf_data['reg_k']
     reg_lambda = conf_data['reg_lambda']
     top1_accuracy = conf_data['top1_accuracy']
-    top5_accuracy = conf_data['top5_accuracy']
     n_calib = conf_data['n_calib']
     conformal_domain = conf_data['conformal_domain']
-    
-    # Create split for this iteration
+
     np.random.seed(random_seed)
     indices = np.random.permutation(len(data_arrays['labels']))
     data_shuffled = {key: data_arrays[key][indices] for key in data_arrays.keys()}
-    
+
     split = {
         'calibration_data': data_shuffled[conformal_domain][:n_calib],
         'calibration_labels': data_shuffled['labels'][:n_calib],
@@ -214,7 +183,7 @@ def compute_iteration(random_seed, conf_data):
         'test_data': data_shuffled[conformal_domain][n_calib:],
         'test_labels': data_shuffled['labels'][n_calib:]
     }
-    
+
     return find_I_single_iteration(
         alpha,
         split['calibration_data'],
@@ -228,20 +197,13 @@ def compute_iteration(random_seed, conf_data):
         mondrian,
         reg_k,
         reg_lambda,
-        1,
-        top1_accuracy,
-        top5_accuracy
+        top1_accuracy
     )
 
 
 def add_row_to_I_table(n_iterations):
-    # Load configuration ONCE at the start
     conf = ConformalConfig()
-    
-    # Convert npz object to plain numpy arrays dict for pickling
     data_arrays = {key: np.array(conf.data[key]) for key in conf.data.files}
-    
-    # Extract all necessary config data into picklable format
     conf_data = {
         'alpha': conf.alpha,
         'data_arrays': data_arrays,
@@ -256,29 +218,36 @@ def add_row_to_I_table(n_iterations):
         'n_calib': conf.n_calib,
         'conformal_domain': conf.conformal_domain,
     }
-    
-    results = joblib.Parallel(n_jobs=conf.n_workers)(
-        joblib.delayed(compute_iteration)(random_seed, conf_data)
-        for random_seed in range(n_iterations)
-    )
 
-    I_values, mean_SSCV_values, worst_SSCV_values = zip(*results)
+    I_values = joblib.Parallel(n_jobs=conf.n_workers)(
+        joblib.delayed(compute_iteration)(random_seed, conf_data)
+        for random_seed in tqdm(range(n_iterations), desc="Computing I values")
+    )
     I_values = list(I_values)
-    mean_SSCV_values = list(mean_SSCV_values)
-    worst_SSCV_values = list(worst_SSCV_values)
-    
-    median_I_value = np.median(I_values)
-    median_mean_sscv = np.median(mean_SSCV_values)
-    median_worst_sscv = np.median(worst_SSCV_values)
-    
-    print(f'Median I value: {median_I_value}, '
-          f'Median of means SSCV: {median_mean_sscv}, '
-          f'Median of Max SSCV: {median_worst_sscv}')
+
+    def spread_stats(values, prefix):
+        arr = np.array(values)
+        median = np.median(arr)
+        p5, p25, p75, p95 = np.percentile(arr, [5, 25, 75, 95])
+        return {
+            f'{prefix}': median,
+            f'{prefix}_std': np.std(arr, ddof=1),
+            f'{prefix}_mad': np.median(np.abs(arr - median)),
+            f'{prefix}_p5': p5,
+            f'{prefix}_p25': p25,
+            f'{prefix}_p75': p75,
+            f'{prefix}_p95': p95,
+            f'{prefix}_iqr': p75 - p25,
+        }
+
+    I_stats = spread_stats(I_values, 'I_value')
+    median_I_value = I_stats['I_value']
+
+    print(f'Median I value: {median_I_value}')
 
     I_table_path = os.path.join(conf.evaluation_dir, 'figures', 'I_table.csv')
     I_table = (pd.read_csv(I_table_path) if os.path.exists(I_table_path) else create_I_table())
-    
-    # Remove existing row if present
+
     mask = (
         (I_table['model_architecture'] == conf.model_architecture) &
         (I_table['dataset'] == conf.dataset) &
@@ -288,8 +257,7 @@ def add_row_to_I_table(n_iterations):
         (I_table['mondrian'] == conf.mondrian)
     )
     I_table = I_table[~mask]
-    
-    # Add new row
+
     new_row = {
         'model_architecture': conf.model_architecture,
         'dataset': conf.dataset,
@@ -299,14 +267,73 @@ def add_row_to_I_table(n_iterations):
         'score_function': conf.score_function,
         'distance_metric': conf.distance_metric,
         'mondrian': conf.mondrian,
-        'SSCV_mean': median_mean_sscv,
-        'SSCV_worst': median_worst_sscv,
-        'I_value': median_I_value,
+        **I_stats,
     }
-    
     I_table = pd.concat([I_table, pd.DataFrame([new_row])], ignore_index=True)
-    I_table.to_csv(os.path.join(conf.evaluation_dir, 'figures', 'I_table.csv'), index=False)
+    I_table.to_csv(I_table_path, index=False)
 
+def create_size_over_alpha_graph(calibration_data, calibration_labels, calibration_preds, test_data, test_labels,
+                                  n_classes, distance_metric, score_function, mondrian, reg_k, reg_lambda,
+                                  top1_accuracy, steps=3000):
+
+    cp = ConformalPrediction(
+        alpha=0.001,  # placeholder; overridden per-call to predict()
+        calibration_data=calibration_data,
+        calibration_labels=calibration_labels,
+        calibration_preds=calibration_preds,
+        test_data=test_data,
+        test_labels=test_labels,
+        n_classes=n_classes,
+        distance_metric=distance_metric,
+        score_function=score_function,
+        mondrian=mondrian,
+        reg_k=reg_k,
+        reg_lambda=reg_lambda
+    )
+    cp.compute_scores()  # expensive step, runs exactly once
+
+    alphas = np.linspace(1/steps, 1, steps)
+    values = []
+    for alpha in tqdm(alphas, desc="Calculating size over alpha"):
+        results_df = cp.predict(alpha=alpha)
+        evaluator = ConformalPredictionEvaluator(results_df, score_function, distance_metric, alpha, mondrian, n_classes)
+        _, avg_size = evaluator.get_accuracy()
+        values.append((alpha, avg_size))
+
+    # Full plot
+    alphas, avg_sizes = zip(*values)
+    plt.figure(figsize=(10, 6))
+    plt.plot(alphas, avg_sizes, label='Average Prediction Set Size', color='blue')
+    plt.axvline(x=(1 - top1_accuracy) / 2, color='orange', linestyle='--', label='(1 - Top-1 Accuracy) / 2')
+    plt.axvline(x=1 - top1_accuracy, color='red', linestyle='--', label='1 - Top-1 Accuracy')
+    plt.axvline(x=1 - top5_accuracy, color='green', linestyle='--', label='1 - Top-5 Accuracy')
+    plt.title('Average Prediction Set Size vs Alpha')
+    plt.xlabel('Alpha')
+    plt.ylabel('Average Prediction Set Size')
+    plt.legend()
+    plt.grid()
+    plt.savefig(f'size_over_alpha_{score_function}_{distance_metric}.png')
+    plt.savefig(f'size_over_alpha_{score_function}_{distance_metric}.eps', format='eps')
+    plt.close()
+
+    # Zoomed plot: (1-top1_accuracy)/2 to (1-top1_accuracy)
+    alphas_arr = np.array(alphas)
+    lo, hi = (1 - top1_accuracy) / 2, 1 - top1_accuracy
+    mask = (alphas_arr >= lo) & (alphas_arr <= hi)
+    zoom_alphas = alphas_arr[mask]
+    zoom_sizes = np.array(avg_sizes)[mask]
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(zoom_alphas, zoom_sizes, label='Average Prediction Set Size', color='blue')
+    plt.title('Average Prediction Set Size vs Alpha (Zoomed In)')
+    plt.xlabel('Alpha')
+    plt.ylabel('Average Prediction Set Size')
+    plt.xlim(lo, hi)
+    plt.legend()
+    plt.grid()
+    plt.savefig(f'size_over_alpha_zoomed_{score_function}_{distance_metric}.png')
+    plt.savefig(f'size_over_alpha_zoomed_{score_function}_{distance_metric}.eps', format='eps')
+    plt.close()
 
 class ConformalPredictionEvaluator():
 
@@ -486,5 +513,40 @@ class ConformalPredictionEvaluator():
 
 if __name__ == "__main__":
 
-    #add_row_to_I_table(n_iterations=100)
-    pass
+    # # Create plot
+    # conf = ConformalConfig()
+
+    # split = conf.create_split(random_seed=42)
+
+    # create_size_over_alpha_graph(
+    #     split['calibration_data'],
+    #     split['calibration_labels'],
+    #     split['calibration_preds'],
+    #     split['test_data'],
+    #     split['test_labels'],
+    #     conf.n_classes,
+    #     conf.distance_metric,
+    #     conf.score_function,
+    #     conf.mondrian,
+    #     conf.reg_k,
+    #     conf.reg_lambda,
+    #     conf.top1_accuracy
+    # )
+
+    # find_I_single_iteration(
+    #     conf.alpha,
+    #     split['calibration_data'],
+    #     split['calibration_labels'],
+    #     split['calibration_preds'],
+    #     split['test_data'],
+    #     split['test_labels'],
+    #     conf.n_classes,
+    #     conf.distance_metric,
+    #     conf.score_function,
+    #     conf.mondrian,
+    #     conf.reg_k,
+    #     conf.reg_lambda,
+    #     conf.top1_accuracy
+    # )
+
+    add_row_to_I_table(n_iterations=100)
