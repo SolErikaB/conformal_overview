@@ -42,6 +42,26 @@ class FeatureExtractorWrapper(nn.Module):
             self.features = nn.Sequential(*children[:-1])
             self.classifier = children[-1]  # classifier
             
+        elif 'vit' in arch_name:
+            class ViTFeatureExtractor(nn.Module):
+                """Reproduces vit_b_16's forward() up to (and including) the CLS token,
+                i.e. everything before the classification head."""
+                def __init__(self, vit_model):
+                    super().__init__()
+                    self.vit = vit_model
+
+                def forward(self, x):
+                    x = self.vit._process_input(x)
+                    n = x.shape[0]
+                    batch_class_token = self.vit.class_token.expand(n, -1, -1)
+                    x = torch.cat([batch_class_token, x], dim=1)
+                    x = self.vit.encoder(x)
+                    x = x[:, 0]  # CLS token -> [batch, 768]
+                    return x
+
+            self.features = ViTFeatureExtractor(base_model)
+            self.classifier = base_model.heads
+
         else:
             raise ValueError(f"Unsupported architecture: {arch_name}")
     
@@ -112,7 +132,7 @@ def save_results(results, save_dir, dataset, model_architecture):
     os.makedirs(save_dir, exist_ok=True)
     
     # Save main results
-    save_path = os.path.join(save_dir, f"{dataset}_imbalanced_{model_architecture}_outputs.npz")
+    save_path = os.path.join(save_dir, f"{dataset}_{model_architecture}_outputs.npz")
     np.savez_compressed(
         save_path,
         logits=results['logits'],
