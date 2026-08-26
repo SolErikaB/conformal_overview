@@ -1,14 +1,12 @@
 import os
 import yaml
 import numpy as np
-from tqdm import tqdm
 import pandas as pd
-import matplotlib.pyplot as plt
 import prepare_models
+from tqdm import *
 from model_eval_and_save_features import FeatureExtractorWrapper
 import torch
-from sklearn.cluster import KMeans
-from sklearn.metrics import pairwise_distances
+
 
 with open("config.yaml", 'r') as f:
         config = yaml.safe_load(f)
@@ -87,26 +85,25 @@ class MarginDistanceScore(DistanceMetric):
         elif self.distance_metric == 'cosine':
             # Find the largest element not equal to the label
 
-                z = np.argmax(datapoint)
-                if z == label:
-                    z = np.argsort(datapoint)[-2]  # second largest if largest is label
+            z = np.argmax(datapoint)
+            if z == label:
+                z = np.argsort(datapoint)[-2]  # second largest if largest is label
 
-                pi_y = datapoint[label]
-                pi_z = datapoint[z]
+            pi_y = datapoint[label]
+            pi_z = datapoint[z]
 
-                a = (pi_y + pi_z) / 2
+            a = (pi_y + pi_z) / 2
 
-                b = datapoint.copy()
-                b[label] = a
-                b[z] = a
+            b = datapoint.copy()
+            b[label] = a
+            b[z] = a
 
-                distance = 1-np.linalg.norm(b)/np.linalg.norm(datapoint)
+            distance = 1-np.linalg.norm(b)/np.linalg.norm(datapoint)
 
-                if current_pred == label:
-                    return -abs(distance)
-                else:
-                    return abs(distance)
-            
+            if current_pred == label:
+                return -abs(distance)
+            else:
+                return abs(distance)
 
 
 class MeanDistanceScore(DistanceMetric):
@@ -140,7 +137,7 @@ class MeanDistanceScore(DistanceMetric):
             self.class_sizes.append(len(class_data))
             self.class_means.append(np.mean(class_data, axis=0))
     
-    def compute_score(self, datapoint, label, exclude_datapoint=False, idx=None):
+    def compute_score(self, datapoint, label, exclude_datapoint=False):
         """Compute distance to class mean, optionally excluding the datapoint.
         
         Args:
@@ -202,7 +199,6 @@ class KMeans3DistanceScore(DistanceMetric):
             distances = [self.compute_distance(datapoint, center) for center in self.KMeans[label].cluster_centers_]
             return min(distances)
 
-
 class RAPS(DistanceMetric):
     """Nonconformity score using Regularized Adaptive Prediction Sets."""
     
@@ -211,7 +207,7 @@ class RAPS(DistanceMetric):
         self.n_classes = n_classes
         self.reg_k = reg_k
         self.reg_lambda = reg_lambda
-
+        
     def compute_score(self, datapoint, label):
 
         target = datapoint[label]
@@ -221,10 +217,13 @@ class RAPS(DistanceMetric):
         r = np.sum(mask) + 1
 
         E = np.sum(datapoint[mask]) if r > 1 else 0
-        
-        u = 0.001
+
+        u = np.random.uniform(0, 1)
+        #u = 0.001
         score = E + u * datapoint[label] + self.reg_lambda * max(r-self.reg_k,0)
 
+#        if r<=2:
+#            print(E, datapoint[label], r, max(r-self.reg_k,0), score)
         return score
 
 
@@ -237,13 +236,14 @@ class SAPS(DistanceMetric):
         self.reg_lambda = reg_lambda
 
     def compute_score(self, datapoint, label):
-
+        
         target = datapoint[label]
 
         r = np.sum(datapoint > target) + 1
         biggest_score = np.max(datapoint)
 
-        u = 0.001
+        u = np.random.uniform(0, 1)
+        #u = 0.001
 
         if r == 1:
             E = u * biggest_score
@@ -257,6 +257,7 @@ class SAPS(DistanceMetric):
 
 
 
+
 class GradientDistanceScore(DistanceMetric):
     """Nonconformity score using gradient-based distance on feature vectors z."""
     
@@ -266,15 +267,14 @@ class GradientDistanceScore(DistanceMetric):
         self.n_classes = n_classes
 
         dataset = config['conformal_prediction']['dataset']
-        dataset = 'cifar10'
         model_architecture = config['conformal_prediction']['model_architecture']
         data_dir = config['training']['data_directory']
         model_dir = config['training']['model_directory']
-        #self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.device=torch.device('cpu')
+        self.device = torch.device('cpu')
 
+        print("before getting datasets")
         _, _, _, num_classes, input_size = prepare_models.get_datasets(dataset, data_dir, seed=123)
-
+        print("after getting datasets")
 
         # Load model
         model = prepare_models.get_model(model_architecture, dataset, num_classes, input_size)
@@ -282,7 +282,6 @@ class GradientDistanceScore(DistanceMetric):
         if dataset != 'imagenet':
             checkpoint = torch.load(model_path, map_location=self.device)
             model.load_state_dict(checkpoint['model_state_dict'])
-
 
         wrapped_model = FeatureExtractorWrapper(model, model_architecture)
         self.model = wrapped_model.to(self.device)
@@ -353,24 +352,16 @@ class FastGradientDistanceScore(DistanceMetric):
         model_architecture = config['conformal_prediction']['model_architecture']
         data_dir = config['training']['data_directory']
         model_dir = config['training']['model_directory']
-        #self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.device = torch.device('cpu')
-
-        if dataset.endswith("_imbalanced"):
-            dataset = dataset[:-11]
-
         _, _, _, num_classes, input_size = prepare_models.get_datasets(dataset, data_dir, seed=123)
 
         # Load model
         model = prepare_models.get_model(model_architecture, dataset, num_classes, input_size)
         model_path = os.path.join(model_dir, dataset, f"{model_architecture}.pth")
-
-        
-
         if dataset != 'imagenet':
             checkpoint = torch.load(model_path, map_location=self.device)
             model.load_state_dict(checkpoint['model_state_dict'])
-            
+
         wrapped_model = FeatureExtractorWrapper(model, model_architecture)
         self.model = wrapped_model.to(self.device)
         self.model.eval()
@@ -393,10 +384,12 @@ class FastGradientDistanceScore(DistanceMetric):
 
         grad = self._compute_gradient(z_pred, y_target)
         grad = grad.norm(p=2, dim=1, keepdim=True)
+        grad = grad.detach().cpu().numpy()
+        grad = grad[0][0]
 
         distance1 = self.compute_distance(output.detach().cpu().numpy(), self._label_to_one_hot(label))
-        grad_distance = distance1 / grad.detach().cpu().numpy()
-
+        grad_distance = distance1 / grad
+        
         return grad_distance
 
     def _compute_gradient(self, z_pred, y_target):
@@ -441,6 +434,7 @@ class NonconformityScore:
                  distance_metric,
                  score_function,
                  mondrian,
+                 n_clusters=None,
                  reg_k=2,
                  reg_lambda=3):
         """
@@ -455,7 +449,8 @@ class NonconformityScore:
         self.n_classes = n_classes
         self.distance_metric = distance_metric
         self.mondrian = mondrian
-
+        self.n_clusters = n_clusters
+        
         if score_function == 'label':
             self.nonconformity_score = LabelDistanceScore(distance_metric, n_classes=n_classes)
 
@@ -464,10 +459,13 @@ class NonconformityScore:
 
         if score_function == 'mean':
             self.nonconformity_score = MeanDistanceScore(calibration_data, calibration_labels, calibration_preds, distance_metric, n_classes=n_classes)
-
+            
         if score_function == 'kmeans3':
             self.nonconformity_score = KMeans3DistanceScore(calibration_data, calibration_labels, calibration_preds, distance_metric, n_classes=n_classes)
 
+        if score_function == 'knn':
+            self.nonconformity_score = KNearestNeighborScore(distance_metric, n_classes=n_classes, k=5)
+        
         if score_function == 'aps':
             reg_k = 0
             reg_lambda = 0
@@ -490,7 +488,7 @@ class NonconformityScore:
         
 class ConformalPrediction(NonconformityScore):
     """Conformal prediction with flexible nonconformity methods."""
-    
+
     def __init__(self,
                  alpha,
                  calibration_data,
@@ -504,20 +502,6 @@ class ConformalPrediction(NonconformityScore):
                  mondrian,
                  reg_k=2,
                  reg_lambda=3):
-        """
-        Initialize conformal predictor.
-        
-        Args:
-            alpha: Significance level
-            calibration_data: Calibration dataset
-            calibration_labels: Labels for calibration data
-            test_data: Test dataset
-            test_labels: Labels for test data
-            n_classes: Number of classes
-            distance_metric: 'euclidean', 'cosine'
-            score_function: 'label', 'mean', 'kmeans', or 'kmedians'
-            mondrian: Whether to use Mondrian conformal prediction
-        """
         super().__init__(
             alpha=alpha,
             calibration_data=calibration_data,
@@ -533,91 +517,111 @@ class ConformalPrediction(NonconformityScore):
             reg_lambda=reg_lambda
         )
         
-        self.calibration_df = None
-        self.results_df = None
         self.alpha = alpha
         self.reg_k = reg_k
         self.reg_lambda = reg_lambda
+
+        self.calibration_df = None
+        self.results_df = None
         self.thresholds = []
-    
-    def calibrate(self):
-        """Calibrate the conformal predictor."""
-        
-        # Compute nonconformity scores for calibration set
+
+        # Cached, alpha-independent artifacts
+        self._calib_distances_by_class = None   # dict: class -> np.array of calib distances
+        self._test_scores = None                # (n_test, n_classes) matrix
+        self._scores_computed = False
+
+    def compute_scores(self):
+        """
+        Compute all nonconformity scores once. This is the expensive step and
+        does NOT depend on alpha, so it should only be called once per
+        calibration/test split, not once per alpha.
+        """
+        # --- Calibration scores ---
         distances = []
-
-        #for i in tqdm(range(len(self.calibration_data)), desc="Calibrating"):
         for i in range(len(self.calibration_data)):
+            if i%1000==0:
+                print("calibrating", i)
             data_point = self.calibration_data[i]
-
             if self.score_function in ['mean', 'kmeans3']:
-                distance = self.nonconformity_score.compute_score(data_point, self.calibration_labels[i], exclude_datapoint=True, idx=i)
+                d = self.nonconformity_score.compute_score(
+                    data_point, self.calibration_labels[i], exclude_datapoint=True
+                )
             else:
-                distance = self.nonconformity_score.compute_score(data_point, self.calibration_labels[i])
-            distances.append(distance)
-    
-        # Store calibration results
+                d = self.nonconformity_score.compute_score(data_point, self.calibration_labels[i])
+            distances.append(d)
+
         self.calibration_df = pd.DataFrame({
             'label': self.calibration_labels,
             'distance': distances
         })
 
-        # Compute thresholds per class
-        self.thresholds = []
-        
+        # Pre-group calibration distances by class so per-alpha threshold
+        # lookups don't repeatedly filter/groupby the DataFrame.
+        self._calib_distances_by_class = {
+            c: self.calibration_df.loc[self.calibration_df['label'] == c, 'distance'].to_numpy()
+            for c in range(self.n_classes)
+        }
+
+        # --- Test scores: n_test x n_classes matrix ---
+        n_test = len(self.test_data)
+        test_scores = np.empty((n_test, self.n_classes))
+        for i in range(n_test):
+            if i%1000==0:
+                print("testing", i, "/", n_test)
+            data_point = self.test_data[i]
+            for c in range(self.n_classes):
+                test_scores[i, c] = self.nonconformity_score.compute_score(data_point, c)
+
+        self._test_scores = test_scores
+        self._scores_computed = True
+
+    def _thresholds_for_alpha(self, alpha):
+        """Cheap: just a quantile lookup over cached distances."""
         if not self.mondrian:
-            # Non-Mondrian: single threshold for all classes
             n = len(self.calibration_df)
-            modified_alpha = (1 - self.alpha) * (n + 1)
-            modified_alpha = np.ceil(modified_alpha) / n
+            modified_alpha = min(np.ceil((1 - alpha) * (n + 1)) / n, 1.0)
             threshold = np.quantile(self.calibration_df['distance'], modified_alpha)
-            self.thresholds = [threshold] * len(self.calibration_df['label'].unique())
-        else:
-            # Mondrian: separate threshold per class
-            for classes in range(self.n_classes):
-                class_distances = self.calibration_df[
-                    self.calibration_df['label'] == classes
-                ]['distance']
-                n_labels = len(class_distances)
-            
-                modified_alpha = (1 - self.alpha) * (n_labels + 1)
-                modified_alpha = min(np.ceil(modified_alpha) / n_labels, 1.0)
-                threshold = np.quantile(class_distances, modified_alpha)
-            
-                self.thresholds.append(threshold)
-    
-    def _compute_prediction_region(self, data_point, label):
-        """Compute prediction region for a data point."""
+            return [threshold] * self.n_classes
 
-        prediction_region = []
+        thresholds = []
+        for c in range(self.n_classes):
+            class_distances = self._calib_distances_by_class[c]
+            n_labels = len(class_distances)
+            if n_labels == 0:
+                thresholds.append(np.inf)  # no calib examples for this class -> never excluded
+                continue
+            modified_alpha = min(np.ceil((1 - alpha) * (n_labels + 1)) / n_labels, 1.0)
+            thresholds.append(np.quantile(class_distances, modified_alpha))
+        return thresholds
 
-        # Test against each class
-        for class_ in range(self.n_classes):
+    def calibrate(self, alpha=None):
+        """
+        Backward-compatible entry point. Computes scores if needed (once),
+        then sets self.thresholds for the given alpha (defaults to self.alpha).
+        """
+        if not self._scores_computed:
+            self.compute_scores()
+        alpha = self.alpha if alpha is None else alpha
+        self.thresholds = self._thresholds_for_alpha(alpha)
 
-            non_conformity_score = self.nonconformity_score.compute_score(data_point, class_)
+    def predict(self, alpha=None):
+        """
+        Run conformal prediction on test data for a given alpha.
+        Reuses cached scores — only recomputes thresholds + set membership.
+        """
+        if not self._scores_computed:
+            self.compute_scores()
 
-            if non_conformity_score <= self.thresholds[class_]:
-                prediction_region.append(class_)
-            
-        return prediction_region
+        alpha = self.alpha if alpha is None else alpha
+        self.thresholds = self._thresholds_for_alpha(alpha)
 
-    def predict(self):
-        """Run conformal prediction on test data."""
-        if self.calibration_df is None:
-            raise ValueError("Must calibrate before predicting. Call calibrate() first.")
-        
-        labels = []
-        prediction_regions = []
-        
-        #for i in tqdm(range(len(self.test_data)), desc="Predicting"):
-        for i in range(len(self.test_data)):
-            prediction_region = self._compute_prediction_region(self.test_data[i], self.test_labels[i])
-            labels.append(self.test_labels[i])
-            prediction_regions.append(prediction_region)
+        thresholds_arr = np.array(self.thresholds)          # (n_classes,)
+        pred_mask = self._test_scores <= thresholds_arr[None, :]   # (n_test, n_classes) bool
+
+        prediction_regions = [np.flatnonzero(row).tolist() for row in pred_mask]
 
         self.results_df = pd.DataFrame({
-            'label': labels,
+            'label': self.test_labels,
             'prediction_region': prediction_regions
         })
-        
         return self.results_df
