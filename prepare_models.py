@@ -14,6 +14,8 @@ from tqdm import tqdm
 import json
 from datetime import datetime
 import yaml
+import matplotlib.pyplot as plt
+
 
 def set_seed(seed):
     """Set all random seeds for reproducibility"""
@@ -293,6 +295,12 @@ def get_model(arch_name, dataset_name, num_classes, input_size):
                 nn.Dropout(p=0.2),
                 nn.Linear(in_features, num_classes)
             )
+
+    elif arch_name == 'vit_b_16':
+        base_model = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
+        if dataset_name != 'imagenet':
+            in_features = base_model.heads.head.in_features
+            base_model.heads.head = nn.Linear(in_features, num_classes)
     
     else:
         raise ValueError(f"Unknown architecture: {arch_name}")
@@ -373,7 +381,7 @@ def train_model(arch_name, dataset_name, data_root, model_root, seed, epochs, ba
     print(f"Using device: {device}")
     
     # Load data
-    train_set, val_set, test_set, num_classes, input_size = get_datasets(dataset_name, data_root, seed, simulate_imbalance=True, keep_fraction=0.1)
+    train_set, val_set, test_set, num_classes, input_size = get_datasets(dataset_name, data_root, seed, simulate_imbalance=False, keep_fraction=0.1)
     
     train_loader = DataLoader(train_set, batch_size=batch_size, 
                             shuffle=True, num_workers=num_workers, 
@@ -476,7 +484,51 @@ def train_model(arch_name, dataset_name, data_root, model_root, seed, epochs, ba
     return history
 
 
+def save_training_plots(history, arch_name, dataset_name):
+    """
+    Saves training/validation loss and accuracy plots.
+    
+    Args:
+        history:      the history dict produced during training
+        arch_name:    e.g. "resnet18"
+        dataset_name: e.g. "cifar10"
+        save_dir:     folder where plots are saved
+    """
+
+    epochs = range(1, len(history['train_loss']) + 1)
+    best_epoch = history.get('best_val_epoch', None)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle(f"{arch_name} on {dataset_name}", fontsize=14, fontweight='bold')
+
+    # --- Loss ---
+    ax = axes[0]
+    ax.plot(epochs, history['train_loss'], label='Train Loss')
+    ax.plot(epochs, history['val_loss'],   label='Val Loss')
+    ax.set_title('Loss')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # --- Accuracy ---
+    ax = axes[1]
+    ax.plot(epochs, history['train_acc'], label='Train Acc')
+    ax.plot(epochs, history['val_acc'],   label='Val Acc')
+    ax.set_title('Accuracy')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Accuracy (%)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(f"training_plot_{arch_name}_{dataset_name}.png", dpi=150, bbox_inches='tight')
+    plt.close()
+
+
 if __name__ == '__main__':
+
+    print(torch.cuda.is_available())
     
     # Fixed seed for reproducibility
     seed = 123
@@ -547,8 +599,8 @@ if __name__ == '__main__':
             all_results[dataset] = {}
         all_results[dataset][model_architecture] = {'error': str(e)}
 
-    # Save summary
-    summary_path = os.path.join(model_directory, 'training_summary.json')
+    # Save summary into a subpath based on dataset
+    summary_path = os.path.join(model_directory, dataset, f'training_summary_{model_architecture}.json')
     with open(summary_path, 'w') as f:
         json.dump({
             'results': all_results,
@@ -564,6 +616,9 @@ if __name__ == '__main__':
                 'timestamp': start_time.isoformat(),
             }
         }, f, indent=2)
+
+    # Save training plots
+    save_training_plots(history, model_architecture, dataset)
     
     print(f"\n{'='*80}")
     print("TRAINING COMPLETE!")
