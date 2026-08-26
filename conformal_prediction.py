@@ -402,13 +402,9 @@ class FastGradientDistanceScore(DistanceMetric):
         
         # Forward pass
         logits = self.classifier(z)
-        
-        # Get the logit for the target class
-        target_logit = logits[0, y_target]
-        
-        # Compute gradient of target_logit with respect to z
-        # This gives us a vector: how does this specific logit change as we move in feature space?
-        grad = torch.autograd.grad(target_logit, z, create_graph=False)[0]
+        probs = torch.softmax(logits, dim=1)
+        target_prob = probs[0, y_target]
+        grad = torch.autograd.grad(target_prob, z)[0]
         
         return grad.detach()
 
