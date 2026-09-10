@@ -267,14 +267,17 @@ class GradientDistanceScore(DistanceMetric):
         self.n_classes = n_classes
 
         dataset = config['conformal_prediction']['dataset']
+
+        # Remove trailing "_imbalanced" from dataset name if present
+        if dataset.endswith('_imbalanced'):
+            dataset = dataset[:-len('_imbalanced')]
+            
         model_architecture = config['conformal_prediction']['model_architecture']
         data_dir = config['training']['data_directory']
         model_dir = config['training']['model_directory']
         self.device = torch.device('cpu')
 
-        print("before getting datasets")
         _, _, _, num_classes, input_size = prepare_models.get_datasets(dataset, data_dir, seed=123)
-        print("after getting datasets")
 
         # Load model
         model = prepare_models.get_model(model_architecture, dataset, num_classes, input_size)
@@ -349,17 +352,22 @@ class FastGradientDistanceScore(DistanceMetric):
         self.n_classes = n_classes
 
         dataset = config['conformal_prediction']['dataset']
+
+        # Remove trailing "_imbalanced" from dataset name if present
+        if dataset.endswith('_imbalanced'):
+            dataset = dataset[:-len('_imbalanced')]
+
         model_architecture = config['conformal_prediction']['model_architecture']
         data_dir = config['training']['data_directory']
         model_dir = config['training']['model_directory']
         self.device = torch.device('cpu')
-        _, _, _, num_classes, input_size = prepare_models.get_datasets(dataset, data_dir, seed=123)
+        _, _, _, num_classes, input_size = prepare_models.get_datasets(dataset, data_dir)
 
         # Load model
         model = prepare_models.get_model(model_architecture, dataset, num_classes, input_size)
         model_path = os.path.join(model_dir, dataset, f"{model_architecture}.pth")
         if dataset != 'imagenet':
-            checkpoint = torch.load(model_path, map_location=self.device)
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=True)
             model.load_state_dict(checkpoint['model_state_dict'])
 
         wrapped_model = FeatureExtractorWrapper(model, model_architecture)
@@ -535,8 +543,6 @@ class ConformalPrediction(NonconformityScore):
         # --- Calibration scores ---
         distances = []
         for i in range(len(self.calibration_data)):
-            if i%1000==0:
-                print("calibrating", i)
             data_point = self.calibration_data[i]
             if self.score_function in ['mean', 'kmeans3']:
                 d = self.nonconformity_score.compute_score(
@@ -562,8 +568,6 @@ class ConformalPrediction(NonconformityScore):
         n_test = len(self.test_data)
         test_scores = np.empty((n_test, self.n_classes))
         for i in range(n_test):
-            if i%1000==0:
-                print("testing", i, "/", n_test)
             data_point = self.test_data[i]
             for c in range(self.n_classes):
                 test_scores[i, c] = self.nonconformity_score.compute_score(data_point, c)

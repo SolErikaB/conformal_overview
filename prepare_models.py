@@ -173,7 +173,7 @@ def get_transforms(dataset_name):
     
     return transform_train, transform_val
 
-def get_datasets(dataset_name, data_root, seed, simulate_imbalance=False, keep_fraction=0.1):
+def get_datasets(dataset_name, data_root, seed=123, simulate_imbalance=False, keep_fraction=0.1):
     
     from torch.utils.data import ConcatDataset
     
