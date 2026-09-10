@@ -1,25 +1,27 @@
 from conformal_prediction import *
 import joblib
 import copy
+from collections import Counter
 
 
 class ConformalConfig:
     """Holds configuration and static data that doesn't change between runs"""
+
     def __init__(self, config_path="config.yaml"):
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-        
+
         self.evaluation_dir = self.config['evaluation']['output_directory']
         self.dataset = self.config['conformal_prediction']['dataset']
         self.model_architecture = self.config['conformal_prediction']['model_architecture']
         self.mondrian = self.config['conformal_prediction'].get('mondrian', False)
-        
+
         # Load static data once
         self.data = np.load(
-            os.path.join(self.evaluation_dir, 
+            os.path.join(self.evaluation_dir,
                         f'{self.dataset}_{self.model_architecture}_outputs.npz')
         )
-        
+
         # Configuration parameters
         self.conformal_domain = self.config['conformal_prediction']['conformal_domain']
         self.score_function = self.config['conformal_prediction']['score_function']
@@ -28,33 +30,86 @@ class ConformalConfig:
         self.reg_k = self.config['conformal_prediction']['reg_k']
         self.reg_lambda = self.config['conformal_prediction']['reg_lambda']
         self.n_workers = self.config['conformal_prediction']['n_workers']
-        
+
         # Load metrics
         metrics_path = os.path.join(
-            self.evaluation_dir, 
+            self.evaluation_dir,
             f"{self.dataset}_{self.model_architecture}_metrics.npz"
         )
         metrics = np.load(metrics_path)
         self.top1_accuracy = metrics['top_1_accuracy']
         self.top5_accuracy = metrics['top_5_accuracy']
-        
+
         self.n_classes = np.unique(self.data['labels']).shape[0]
         self.n_calib = 40000 if self.dataset == 'imagenet' else 10000
-    
-    def create_split(self, random_seed):
-        """Create a random calibration/test split"""
+
+    # ---- Splitting ---------------------------------------------------
+
+    @staticmethod
+    def make_split(random_seed, data_arrays, n_calib, conformal_domain):
+        """
+        Create a random calibration/test split from a dict of plain numpy
+        arrays. This is the single source of truth for the split logic -
+        both `create_split` (used in-process) and the joblib worker
+        functions below (which only have picklable plain arrays, not a
+        ConformalConfig instance with an open npz file handle) call this.
+        """
         np.random.seed(random_seed)
-        indices = np.random.permutation(len(self.data['labels']))
-        
-        data_shuffled = {key: self.data[key][indices] for key in self.data.files}
-        
+        indices = np.random.permutation(len(data_arrays['labels']))
+        shuffled = {key: arr[indices] for key, arr in data_arrays.items()}
+
         return {
-            'calibration_data': data_shuffled[self.conformal_domain][:self.n_calib],
-            'calibration_labels': data_shuffled['labels'][:self.n_calib],
-            'calibration_preds': data_shuffled['probabilities'][:self.n_calib].argmax(axis=1),
-            'test_data': data_shuffled[self.conformal_domain][self.n_calib:],
-            'test_labels': data_shuffled['labels'][self.n_calib:]
+            'calibration_data': shuffled[conformal_domain][:n_calib],
+            'calibration_labels': shuffled['labels'][:n_calib],
+            'calibration_preds': shuffled['probabilities'][:n_calib].argmax(axis=1),
+            'test_data': shuffled[conformal_domain][n_calib:],
+            'test_labels': shuffled['labels'][n_calib:],
         }
+
+    def create_split(self, random_seed):
+        """Create a random calibration/test split using this config's own data"""
+        data_arrays = {key: np.array(self.data[key]) for key in self.data.files}
+        return self.make_split(random_seed, data_arrays, self.n_calib, self.conformal_domain)
+
+    # ---- Worker payload ------------------------------------------------
+
+    def to_worker_dict(self):
+        """
+        Bundle everything a joblib worker process needs into one picklable
+        dict. self.data is an npz NpzFile backed by an open file handle, so
+        we can't hand `self` to a subprocess directly - unpack it into
+        plain arrays once here instead.
+        """
+        return {
+            'alpha': self.alpha,
+            'data_arrays': {key: np.array(self.data[key]) for key in self.data.files},
+            'n_classes': self.n_classes,
+            'distance_metric': self.distance_metric,
+            'score_function': self.score_function,
+            'mondrian': self.mondrian,
+            'reg_k': self.reg_k,
+            'reg_lambda': self.reg_lambda,
+            'top1_accuracy': self.top1_accuracy,
+            'top5_accuracy': self.top5_accuracy,
+            'n_calib': self.n_calib,
+            'conformal_domain': self.conformal_domain,
+        }
+
+
+def run_parallel_iterations(conf, worker_fn, n_iterations, desc):
+    """
+    Run `worker_fn(random_seed, conf_data)` for random_seed in
+    range(n_iterations), in parallel across conf.n_workers processes.
+    Shared driver for add_row_to_I_table and
+    compute_prevalence_of_minority_classes, which previously duplicated
+    this exact Parallel/tqdm setup.
+    """
+    conf_data = conf.to_worker_dict()
+    return joblib.Parallel(n_jobs=conf.n_workers)(
+        joblib.delayed(worker_fn)(random_seed, conf_data)
+        for random_seed in tqdm(range(n_iterations), desc=desc)
+    )
+
 
 def run_cp_once(alpha, calibration_data, calibration_labels, calibration_preds, test_data, test_labels,
                  n_classes, distance_metric, score_function, mondrian, reg_k, reg_lambda,
@@ -157,74 +212,37 @@ def create_I_table():
 
 
 def compute_iteration(random_seed, conf_data):
-    """
-    Worker function that runs a single iteration with pre-loaded config data.
-    conf_data is a dict containing all necessary config values (picklable).
-    """
-    alpha = conf_data['alpha']
-    data_arrays = conf_data['data_arrays']
-    n_classes = conf_data['n_classes']
-    distance_metric = conf_data['distance_metric']
-    score_function = conf_data['score_function']
-    mondrian = conf_data['mondrian']
-    reg_k = conf_data['reg_k']
-    reg_lambda = conf_data['reg_lambda']
-    top1_accuracy = conf_data['top1_accuracy']
-    n_calib = conf_data['n_calib']
-    conformal_domain = conf_data['conformal_domain']
-
-    np.random.seed(random_seed)
-    indices = np.random.permutation(len(data_arrays['labels']))
-    data_shuffled = {key: data_arrays[key][indices] for key in data_arrays.keys()}
-
-    split = {
-        'calibration_data': data_shuffled[conformal_domain][:n_calib],
-        'calibration_labels': data_shuffled['labels'][:n_calib],
-        'calibration_preds': data_shuffled['probabilities'][:n_calib].argmax(axis=1),
-        'test_data': data_shuffled[conformal_domain][n_calib:],
-        'test_labels': data_shuffled['labels'][n_calib:]
-    }
+    """Worker: compute a single I value for one calibration/test split."""
+    split = ConformalConfig.make_split(
+        random_seed,
+        conf_data['data_arrays'],
+        conf_data['n_calib'],
+        conf_data['conformal_domain'],
+    )
 
     return find_I_single_iteration(
-        alpha,
+        conf_data['alpha'],
         split['calibration_data'],
         split['calibration_labels'],
         split['calibration_preds'],
         split['test_data'],
         split['test_labels'],
-        n_classes,
-        distance_metric,
-        score_function,
-        mondrian,
-        reg_k,
-        reg_lambda,
-        top1_accuracy
+        conf_data['n_classes'],
+        conf_data['distance_metric'],
+        conf_data['score_function'],
+        conf_data['mondrian'],
+        conf_data['reg_k'],
+        conf_data['reg_lambda'],
+        conf_data['top1_accuracy']
     )
 
 
 def add_row_to_I_table(n_iterations):
     conf = ConformalConfig()
-    data_arrays = {key: np.array(conf.data[key]) for key in conf.data.files}
-    conf_data = {
-        'alpha': conf.alpha,
-        'data_arrays': data_arrays,
-        'n_classes': conf.n_classes,
-        'distance_metric': conf.distance_metric,
-        'score_function': conf.score_function,
-        'mondrian': conf.mondrian,
-        'reg_k': conf.reg_k,
-        'reg_lambda': conf.reg_lambda,
-        'top1_accuracy': conf.top1_accuracy,
-        'top5_accuracy': conf.top5_accuracy,
-        'n_calib': conf.n_calib,
-        'conformal_domain': conf.conformal_domain,
-    }
 
-    I_values = joblib.Parallel(n_jobs=conf.n_workers)(
-        joblib.delayed(compute_iteration)(random_seed, conf_data)
-        for random_seed in tqdm(range(n_iterations), desc="Computing I values")
-    )
-    I_values = list(I_values)
+    I_values = list(run_parallel_iterations(
+        conf, compute_iteration, n_iterations, desc="Computing I values"
+    ))
 
     def spread_stats(values, prefix):
         arr = np.array(values)
@@ -271,83 +289,53 @@ def add_row_to_I_table(n_iterations):
         **I_stats,
     }
     I_table = pd.concat([I_table, pd.DataFrame([new_row])], ignore_index=True)
-    I_table.to_csv(I_table_path, index=False)
+    #I_table.to_csv(I_table_path, index=False)
+
 
 def compute_prevalence_iteration(random_seed, conf_data):
-    alpha = conf_data['alpha']
-    data_arrays = conf_data['data_arrays']
-    n_classes = conf_data['n_classes']
-    distance_metric = conf_data['distance_metric']
-    score_function = conf_data['score_function']
-    mondrian = conf_data['mondrian']
-    reg_k = conf_data['reg_k']
-    reg_lambda = conf_data['reg_lambda']
-    top1_accuracy = conf_data['top1_accuracy']
-    n_calib = conf_data['n_calib']
-    conformal_domain = conf_data['conformal_domain']
-
-    np.random.seed(random_seed)
-    indices = np.random.permutation(len(data_arrays['labels']))
-    data_shuffled = {key: data_arrays[key][indices] for key in data_arrays.keys()}
-
-    split = {
-        'calibration_data': data_shuffled[conformal_domain][:n_calib],
-        'calibration_labels': data_shuffled['labels'][:n_calib],
-        'calibration_preds': data_shuffled['probabilities'][:n_calib].argmax(axis=1),
-        'test_data': data_shuffled[conformal_domain][n_calib:],
-        'test_labels': data_shuffled['labels'][n_calib:]
-    }
+    """Worker: compute minority-class prevalence for one calibration/test split."""
+    split = ConformalConfig.make_split(
+        random_seed,
+        conf_data['data_arrays'],
+        conf_data['n_calib'],
+        conf_data['conformal_domain'],
+    )
 
     results_df = run_cp_once(
-        alpha,
+        conf_data['alpha'],
         split['calibration_data'],
         split['calibration_labels'],
         split['calibration_preds'],
         split['test_data'],
         split['test_labels'],
-        n_classes,
-        distance_metric,
-        score_function,
-        mondrian,
-        reg_k,
-        reg_lambda,
+        conf_data['n_classes'],
+        conf_data['distance_metric'],
+        conf_data['score_function'],
+        conf_data['mondrian'],
+        conf_data['reg_k'],
+        conf_data['reg_lambda'],
         parallel=False,
         n_workers=1
     )
 
     evaluator = ConformalPredictionEvaluator(
         results_df,
-        score_function,
-        distance_metric,
-        alpha,
-        mondrian,
-        n_classes
+        conf_data['score_function'],
+        conf_data['distance_metric'],
+        conf_data['alpha'],
+        conf_data['mondrian'],
+        conf_data['n_classes']
     )
 
     return evaluator.prevalence_of_minority_classes()
 
+
 def compute_prevalence_of_minority_classes(n_iterations):
-
     conf = ConformalConfig()
-    data_arrays = {key: np.array(conf.data[key]) for key in conf.data.files}
-    conf_data = {
-        'alpha': conf.alpha,
-        'data_arrays': data_arrays,
-        'n_classes': conf.n_classes,
-        'distance_metric': conf.distance_metric,
-        'score_function': conf.score_function,
-        'mondrian': conf.mondrian,
-        'reg_k': conf.reg_k,
-        'reg_lambda': conf.reg_lambda,
-        'top1_accuracy': conf.top1_accuracy,
-        'top5_accuracy': conf.top5_accuracy,
-        'n_calib': conf.n_calib,
-        'conformal_domain': conf.conformal_domain,
-    }
 
-    results = joblib.Parallel(n_jobs=conf.n_workers)(
-        joblib.delayed(compute_prevalence_iteration)(random_seed, conf_data)
-        for random_seed in tqdm(range(n_iterations), desc="Computing prevalence of minority classes")
+    results = run_parallel_iterations(
+        conf, compute_prevalence_iteration, n_iterations,
+        desc="Computing prevalence of minority classes"
     )
 
     true_proportions, expected_proportions = zip(*results)
@@ -355,6 +343,7 @@ def compute_prevalence_of_minority_classes(n_iterations):
     median_expected_proportion = np.median(expected_proportions)
 
     return median_true_proportion, median_expected_proportion
+
 
 def create_size_over_alpha_graph(calibration_data, calibration_labels, calibration_preds, test_data, test_labels,
                                   n_classes, distance_metric, score_function, mondrian, reg_k, reg_lambda,
@@ -418,6 +407,7 @@ def create_size_over_alpha_graph(calibration_data, calibration_labels, calibrati
     plt.savefig(f'size_over_alpha_zoomed_{score_function}_{distance_metric}.eps', format='eps')
     plt.close()
 
+
 class ConformalPredictionEvaluator():
 
     def __init__(self, results_df, score_function, distance_metric, alpha, mondrian, n_classes):
@@ -447,8 +437,7 @@ class ConformalPredictionEvaluator():
         if print_acc:
             print(f"Accuracy Results:")
             print("-" * 50)
-        
-        prediction_regions = self.results_df['prediction_region'].tolist()
+
         n_classes = len(np.unique(self.results_df['label']))
 
         if mondrian:
@@ -466,16 +455,16 @@ class ConformalPredictionEvaluator():
 
                 accuracy_per_class[i] = accuracy
                 avg_size_per_class[i] = avg_size
-                
+
             return accuracy_per_class, avg_size_per_class
 
         else:
-            for prediction_region in prediction_regions:
+            for label, prediction_region in zip(self.results_df['label'], self.results_df['prediction_region']):
                 overall_count += 1
                 overall_size += len(prediction_region)
                 if len(prediction_region) == 0:
                     overall_empty += 1
-                if self.results_df.iloc[overall_count - 1]['label'] in prediction_region:
+                if label in prediction_region:
                     overall_correct += 1
 
             overall_accuracy = overall_correct / overall_count
@@ -488,153 +477,36 @@ class ConformalPredictionEvaluator():
 
             return overall_accuracy, overall_avg_size
 
-    def size_stratified_coverage_violation(self):
-        """Compute the size-stratified coverage violation as described in equation (5) in https://arxiv.org/pdf/2009.14193"""
-
-        def create_adaptive_bins(min_bin_size=100, max_bins=10):
-            """Create approximately equal sized bins"""
-
-            sizes = self.results_df['prediction_region'].apply(len)
-            bins = []
-
-            low = 1
-
-            quartile = None
-
-            while len(bins) < max_bins:
-
-                # If this is the last bin, just take everything remaining
-                if len(bins) == max_bins-1:
-                    bins.append((low, self.n_classes))
-                    return bins
-
-                for high in range(low, self.n_classes+1):
-
-                    # Check how many examples are available to go into the next bin to see if this is the last bin
-                    n_remaining_after = (sizes > high).sum()
-
-                    # If not enough for even one bin, just make one final bin
-                    if n_remaining_after < min_bin_size:
-                        bins.append((low, self.n_classes))
-                        return bins
-
-                    if not quartile:
-                        max_remaining_bins = min(max_bins-len(bins), n_remaining_after//min_bin_size)
-                        quartile = n_remaining_after//max_remaining_bins
-
-                    # Randomize so bin size sometimes is just below quartile, sometimes above it
-                    n_in_bin = ((sizes >= low) & (sizes <= high + np.random.randint(2))).sum()
-
-                    if n_in_bin >= quartile:
-                        bins.append((low, high))
-                        break
-
-                if high==self.n_classes:
-                    bins.append((low,high))
-                    return bins
-
-                low = high+1
-
-            return bins
-
-        bins = create_adaptive_bins()
-
-        SSCV = 0
-
-        for low, high in bins:
-
-            sizes = self.results_df['prediction_region'].apply(len)
-            result_bin = self.results_df[(sizes >= low) & (sizes <= high)]
-
-            J = len(result_bin)
-            if J==0: continue
-
-            covered = result_bin.apply(
-                lambda row: row['label'] in row['prediction_region'],
-                axis=1
-            )
-
-            I = covered.sum()
-
-            value = abs(I/J-(1-self.alpha))
-
-
-            if value>SSCV:
-                SSCV = value
-        
-        return SSCV
-        
     def prevalence_of_minority_classes(self):
 
         counts = self.results_df["label"].value_counts()
         max_count = counts.max()
-        minority_classes = counts[counts<0.3*max_count].index.tolist()
+        minority_classes = counts[counts < 0.3 * max_count].index.tolist()
+
+        if not minority_classes:
+            return 0.0, 0.0
 
         prediction_regions = self.results_df['prediction_region'].tolist()
+        n_regions = len(prediction_regions)
 
-        mean_true_proportion = 0
-        mean_expected_proportion = 0
+        # Single pass over all prediction regions, tallying how many times
+        # each class appears anywhere in a region. Previously this rescanned
+        # the full list of prediction regions once per minority class
+        # (O(minority_classes * n_regions)); this does it in one pass
+        # (O(n_regions)) and just looks up the counts we need afterward.
+        class_region_counts = Counter()
+        for region in prediction_regions:
+            class_region_counts.update(region)
 
+        true_proportions = []
+        expected_proportions = []
         for minority_class in minority_classes:
-            expected_proportion = counts[minority_class]/counts.sum()
+            expected_proportions.append(counts[minority_class] / counts.sum())
+            true_proportions.append(class_region_counts.get(minority_class, 0) / n_regions)
 
-            count_class = 0
-
-            for prediction_region in prediction_regions:
-                if minority_class in prediction_region:
-                    count_class += 1
-
-            true_proportion = count_class / len(prediction_regions)
-
-            mean_true_proportion += true_proportion/len(minority_classes)
-            mean_expected_proportion += expected_proportion/len(minority_classes)
-
-        return mean_true_proportion, mean_expected_proportion
-        
-
+        return float(np.mean(true_proportions)), float(np.mean(expected_proportions))
 
 
 if __name__ == "__main__":
 
-    # # Create plot
-    # conf = ConformalConfig()
-
-    # split = conf.create_split(random_seed=42)
-
-    # create_size_over_alpha_graph(
-    #     split['calibration_data'],
-    #     split['calibration_labels'],
-    #     split['calibration_preds'],
-    #     split['test_data'],
-    #     split['test_labels'],
-    #     conf.n_classes,
-    #     conf.distance_metric,
-    #     conf.score_function,
-    #     conf.mondrian,
-    #     conf.reg_k,
-    #     conf.reg_lambda,
-    #     conf.top1_accuracy
-    # )
-
-    # find_I_single_iteration(
-    #     conf.alpha,
-    #     split['calibration_data'],
-    #     split['calibration_labels'],
-    #     split['calibration_preds'],
-    #     split['test_data'],
-    #     split['test_labels'],
-    #     conf.n_classes,
-    #     conf.distance_metric,
-    #     conf.score_function,
-    #     conf.mondrian,
-    #     conf.reg_k,
-    #     conf.reg_lambda,
-    #     conf.top1_accuracy
-    # )
-
-    #add_row_to_I_table(n_iterations=100)
-
-    # prevalence of minority classes
-    median_true_proportion, median_expected_proportion = compute_prevalence_of_minority_classes(n_iterations=100)
-    print(f'Median true proportion of minority classes: {median_true_proportion:.4f}')
-    print(f'Median expected proportion of minority classes: {median_expected_proportion:.4f}')
+    add_row_to_I_table(n_iterations=100)
