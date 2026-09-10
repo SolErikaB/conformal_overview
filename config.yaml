@@ -1,0 +1,26 @@
+training:
+  data_directory: '/data'
+  model_directory: '/models'
+  num_workers: 4
+  dataset: 'cifar10'
+  model_architecture: 'resnet50'
+
+evaluation:
+  dataset: 'cifar10'
+  model_architecture: 'resnet50'
+  output_directory: '/outputs'
+  num_workers: 4
+
+conformal_prediction:
+  dataset: 'cifar10' # imagenet, cifar10, cifar100 (fashionmnist elected not to be included)
+  model_architecture: 'resnet18' # resnet18, resnet50, efficientnet_b0, vit_b_16
+
+  conformal_domain: 'logits' # probabilities, logits, features
+  score_function: 'mean' # label, margin, mean, kmeans3, kmedians, gradient, fast_gradient, aps, raps, saps
+  n_clusters: 1 # for cluster
+  reg_k: 1 # for RAPS
+  reg_lambda: 0.2 #for RAPS and SAPS
+  distance_metric: 'cosine' # euclidean, cosine
+  alpha: 0.10
+  mondrian: false
+  n_workers: 10
