@@ -2,6 +2,7 @@ from conformal_prediction import *
 import joblib
 import copy
 
+
 class ConformalConfig:
     """Holds configuration and static data that doesn't change between runs"""
     def __init__(self, config_path="config.yaml"):
@@ -272,6 +273,89 @@ def add_row_to_I_table(n_iterations):
     I_table = pd.concat([I_table, pd.DataFrame([new_row])], ignore_index=True)
     I_table.to_csv(I_table_path, index=False)
 
+def compute_prevalence_iteration(random_seed, conf_data):
+    alpha = conf_data['alpha']
+    data_arrays = conf_data['data_arrays']
+    n_classes = conf_data['n_classes']
+    distance_metric = conf_data['distance_metric']
+    score_function = conf_data['score_function']
+    mondrian = conf_data['mondrian']
+    reg_k = conf_data['reg_k']
+    reg_lambda = conf_data['reg_lambda']
+    top1_accuracy = conf_data['top1_accuracy']
+    n_calib = conf_data['n_calib']
+    conformal_domain = conf_data['conformal_domain']
+
+    np.random.seed(random_seed)
+    indices = np.random.permutation(len(data_arrays['labels']))
+    data_shuffled = {key: data_arrays[key][indices] for key in data_arrays.keys()}
+
+    split = {
+        'calibration_data': data_shuffled[conformal_domain][:n_calib],
+        'calibration_labels': data_shuffled['labels'][:n_calib],
+        'calibration_preds': data_shuffled['probabilities'][:n_calib].argmax(axis=1),
+        'test_data': data_shuffled[conformal_domain][n_calib:],
+        'test_labels': data_shuffled['labels'][n_calib:]
+    }
+
+    results_df = run_cp_once(
+        alpha,
+        split['calibration_data'],
+        split['calibration_labels'],
+        split['calibration_preds'],
+        split['test_data'],
+        split['test_labels'],
+        n_classes,
+        distance_metric,
+        score_function,
+        mondrian,
+        reg_k,
+        reg_lambda,
+        parallel=False,
+        n_workers=1
+    )
+
+    evaluator = ConformalPredictionEvaluator(
+        results_df,
+        score_function,
+        distance_metric,
+        alpha,
+        mondrian,
+        n_classes
+    )
+
+    return evaluator.prevalence_of_minority_classes()
+
+def compute_prevalence_of_minority_classes(n_iterations):
+
+    conf = ConformalConfig()
+    data_arrays = {key: np.array(conf.data[key]) for key in conf.data.files}
+    conf_data = {
+        'alpha': conf.alpha,
+        'data_arrays': data_arrays,
+        'n_classes': conf.n_classes,
+        'distance_metric': conf.distance_metric,
+        'score_function': conf.score_function,
+        'mondrian': conf.mondrian,
+        'reg_k': conf.reg_k,
+        'reg_lambda': conf.reg_lambda,
+        'top1_accuracy': conf.top1_accuracy,
+        'top5_accuracy': conf.top5_accuracy,
+        'n_calib': conf.n_calib,
+        'conformal_domain': conf.conformal_domain,
+    }
+
+    results = joblib.Parallel(n_jobs=conf.n_workers)(
+        joblib.delayed(compute_prevalence_iteration)(random_seed, conf_data)
+        for random_seed in tqdm(range(n_iterations), desc="Computing prevalence of minority classes")
+    )
+
+    true_proportions, expected_proportions = zip(*results)
+    median_true_proportion = np.median(true_proportions)
+    median_expected_proportion = np.median(expected_proportions)
+
+    return median_true_proportion, median_expected_proportion
+
 def create_size_over_alpha_graph(calibration_data, calibration_labels, calibration_preds, test_data, test_labels,
                                   n_classes, distance_metric, score_function, mondrian, reg_k, reg_lambda,
                                   top1_accuracy, steps=3000):
@@ -306,7 +390,6 @@ def create_size_over_alpha_graph(calibration_data, calibration_labels, calibrati
     plt.plot(alphas, avg_sizes, label='Average Prediction Set Size', color='blue')
     plt.axvline(x=(1 - top1_accuracy) / 2, color='orange', linestyle='--', label='(1 - Top-1 Accuracy) / 2')
     plt.axvline(x=1 - top1_accuracy, color='red', linestyle='--', label='1 - Top-1 Accuracy')
-    plt.axvline(x=1 - top5_accuracy, color='green', linestyle='--', label='1 - Top-5 Accuracy')
     plt.title('Average Prediction Set Size vs Alpha')
     plt.xlabel('Alpha')
     plt.ylabel('Average Prediction Set Size')
@@ -549,4 +632,9 @@ if __name__ == "__main__":
     #     conf.top1_accuracy
     # )
 
-    add_row_to_I_table(n_iterations=100)
+    #add_row_to_I_table(n_iterations=100)
+
+    # prevalence of minority classes
+    median_true_proportion, median_expected_proportion = compute_prevalence_of_minority_classes(n_iterations=100)
+    print(f'Median true proportion of minority classes: {median_true_proportion:.4f}')
+    print(f'Median expected proportion of minority classes: {median_expected_proportion:.4f}')
