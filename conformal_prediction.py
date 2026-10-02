@@ -3,7 +3,6 @@ import yaml
 import numpy as np
 import pandas as pd
 import prepare_models
-from tqdm import *
 from model_eval_and_save_features import FeatureExtractorWrapper
 import torch
 
@@ -218,8 +217,8 @@ class RAPS(DistanceMetric):
 
         E = np.sum(datapoint[mask]) if r > 1 else 0
 
-        u = np.random.uniform(0, 1)
-        #u = 0.001
+        #u = np.random.uniform(0, 1)
+        u = 0.001
         score = E + u * datapoint[label] + self.reg_lambda * max(r-self.reg_k,0)
 
 #        if r<=2:
@@ -261,18 +260,15 @@ class SAPS(DistanceMetric):
 class GradientDistanceScore(DistanceMetric):
     """Nonconformity score using gradient-based distance on feature vectors z."""
     
-    def __init__(self, distance_metric, n_classes):
+    def __init__(self, distance_metric, n_classes, model_architecture, dataset):
         super().__init__(distance_metric)
 
         self.n_classes = n_classes
 
-        dataset = config['conformal_prediction']['dataset']
-
         # Remove trailing "_imbalanced" from dataset name if present
         if dataset.endswith('_imbalanced'):
             dataset = dataset[:-len('_imbalanced')]
-            
-        model_architecture = config['conformal_prediction']['model_architecture']
+    
         data_dir = config['training']['data_directory']
         model_dir = config['training']['model_directory']
         self.device = torch.device('cpu')
@@ -346,22 +342,19 @@ class GradientDistanceScore(DistanceMetric):
 class FastGradientDistanceScore(DistanceMetric):
     """Nonconformity score using gradient-based distance on feature vectors z."""
     
-    def __init__(self, distance_metric, n_classes):
+    def __init__(self, distance_metric, n_classes, model_architecture, dataset):
         super().__init__(distance_metric)
 
         self.n_classes = n_classes
-
-        dataset = config['conformal_prediction']['dataset']
 
         # Remove trailing "_imbalanced" from dataset name if present
         if dataset.endswith('_imbalanced'):
             dataset = dataset[:-len('_imbalanced')]
 
-        model_architecture = config['conformal_prediction']['model_architecture']
         data_dir = config['training']['data_directory']
         model_dir = config['training']['model_directory']
         self.device = torch.device('cpu')
-        _, _, _, num_classes, input_size = prepare_models.get_datasets(dataset, data_dir)
+        _, _, _, num_classes, input_size = prepare_models.get_datasets(dataset, data_dir, seed=123)
 
         # Load model
         model = prepare_models.get_model(model_architecture, dataset, num_classes, input_size)
@@ -440,7 +433,9 @@ class NonconformityScore:
                  mondrian,
                  n_clusters=None,
                  reg_k=2,
-                 reg_lambda=3):
+                 reg_lambda=3,
+                 model_architecture=None,
+                 dataset=None):
         """
         Initialize nonconformity score.
         """
@@ -482,10 +477,10 @@ class NonconformityScore:
             self.nonconformity_score = SAPS(distance_metric, n_classes=n_classes, reg_lambda=reg_lambda)
 
         if score_function == 'gradient':
-            self.nonconformity_score = GradientDistanceScore(distance_metric, n_classes=n_classes)
+            self.nonconformity_score = GradientDistanceScore(distance_metric, n_classes=n_classes, model_architecture=model_architecture, dataset=dataset)
 
         if score_function == 'fast_gradient':
-            self.nonconformity_score = FastGradientDistanceScore(distance_metric, n_classes=n_classes)
+            self.nonconformity_score = FastGradientDistanceScore(distance_metric, n_classes=n_classes, model_architecture=model_architecture, dataset=dataset)
 
         self.score_function = score_function
 
@@ -505,7 +500,10 @@ class ConformalPrediction(NonconformityScore):
                  score_function,
                  mondrian,
                  reg_k=2,
-                 reg_lambda=3):
+                 reg_lambda=3,
+                 model_architecture=None,
+                 dataset=None
+                 ):
         super().__init__(
             alpha=alpha,
             calibration_data=calibration_data,
@@ -518,7 +516,9 @@ class ConformalPrediction(NonconformityScore):
             score_function=score_function,
             mondrian=mondrian,
             reg_k=reg_k,
-            reg_lambda=reg_lambda
+            reg_lambda=reg_lambda,
+            model_architecture=model_architecture,
+            dataset=dataset
         )
         
         self.alpha = alpha
@@ -576,23 +576,39 @@ class ConformalPrediction(NonconformityScore):
         self._scores_computed = True
 
     def _thresholds_for_alpha(self, alpha):
-        """Cheap: just a quantile lookup over cached distances."""
         if not self.mondrian:
-            n = len(self.calibration_df)
-            modified_alpha = min(np.ceil((1 - alpha) * (n + 1)) / n, 1.0)
-            threshold = np.quantile(self.calibration_df['distance'], modified_alpha)
-            return [threshold] * self.n_classes
+            d = self.calibration_df['distance'].to_numpy()
+            n = len(d)
+            level = np.ceil((1 - alpha) * (n + 1)) / n
+            if level > 1.0:
+                return [np.inf] * self.n_classes
+            return [np.quantile(d, level, method='inverted_cdf')] * self.n_classes
 
         thresholds = []
         for c in range(self.n_classes):
-            class_distances = self._calib_distances_by_class[c]
-            n_labels = len(class_distances)
-            if n_labels == 0:
-                thresholds.append(np.inf)  # no calib examples for this class -> never excluded
+            d = self._calib_distances_by_class[c]
+            n = len(d)
+            if n == 0:
+                thresholds.append(np.inf)
                 continue
-            modified_alpha = min(np.ceil((1 - alpha) * (n_labels + 1)) / n_labels, 1.0)
-            thresholds.append(np.quantile(class_distances, modified_alpha))
+            level = np.ceil((1 - alpha) * (n + 1)) / n
+            thresholds.append(np.inf if level > 1.0
+                            else np.quantile(d, level, method='inverted_cdf'))
         return thresholds
+
+    def _pvalues(self, scores):
+        """Vectorised p-values, (m, n_classes). Pooled if not mondrian."""
+        P = np.empty_like(scores, dtype=float)
+        if self.mondrian:
+            for c in range(self.n_classes):
+                calib = np.sort(self._calib_distances_by_class[c])
+                cnt = len(calib) - np.searchsorted(calib, scores[:, c], side='left')  # count >= score
+                P[:, c] = (cnt + 1) / (len(calib) + 1)
+        else:
+            calib = np.sort(self.calibration_df['distance'].to_numpy())
+            cnt = len(calib) - np.searchsorted(calib, scores, side='left')
+            P = (cnt + 1) / (len(calib) + 1)
+        return P
 
     def calibrate(self, alpha=None):
         """
@@ -625,3 +641,29 @@ class ConformalPrediction(NonconformityScore):
             'prediction_region': prediction_regions
         })
         return self.results_df
+
+
+    def predict_with_scores(self, alpha=None):
+        """Like predict(), but also returns raw scores and p-values (pooled if not mondrian)."""
+        if not self._scores_computed:
+            self.compute_scores()
+
+        alpha = self.alpha if alpha is None else alpha
+        self.thresholds = self._thresholds_for_alpha(alpha)
+
+        thresholds_arr = np.array(self.thresholds)
+        pred_mask = self._test_scores <= thresholds_arr[None, :]
+        prediction_regions = [np.flatnonzero(row).tolist() for row in pred_mask]
+
+        P = self._pvalues(self._test_scores)
+
+        df = pd.DataFrame({
+            'label': self.test_labels,
+            'prediction_region': prediction_regions
+        })
+        for c in range(self.n_classes):
+            df[f'score_class_{c}'] = self._test_scores[:, c]
+            df[f'pvalue_class_{c}'] = P[:, c]
+
+        self.results_df = df
+        return df
