@@ -474,8 +474,8 @@ def train_model(arch_name, dataset_name, data_root, model_root, seed, epochs, ba
 
 def save_training_plots(history, arch_name, dataset_name):
     """
-    Saves training/validation loss and accuracy plots.
-    
+    Saves the training and validation loss plot.
+
     Args:
         history:      the history dict produced during training
         arch_name:    e.g. "resnet18"
@@ -484,26 +484,14 @@ def save_training_plots(history, arch_name, dataset_name):
     """
 
     epochs = range(1, len(history['train_loss']) + 1)
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, ax = plt.subplots(figsize=(10, 5))
     fig.suptitle(f"{arch_name} on {dataset_name}", fontsize=14, fontweight='bold')
 
-    # --- Loss ---
-    ax = axes[0]
     ax.plot(epochs, history['train_loss'], label='Train Loss')
-    ax.plot(epochs, history['val_loss'],   label='Val Loss')
+    ax.plot(epochs, history['val_loss'], label='Val Loss')
     ax.set_title('Loss')
     ax.set_xlabel('Epoch')
     ax.set_ylabel('Loss')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # --- Accuracy ---
-    ax = axes[1]
-    ax.plot(epochs, history['train_acc'], label='Train Acc')
-    ax.plot(epochs, history['val_acc'],   label='Val Acc')
-    ax.set_title('Accuracy')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Accuracy (%)')
     ax.legend()
     ax.grid(True, alpha=0.3)
 
