@@ -431,8 +431,6 @@ def train_model(arch_name, dataset_name, data_root, model_root, seed, epochs, ba
     }
     
     # Train for fixed number of epochs
-    best_val_acc = 0
-    best_epoch = 0
     for epoch in range(epochs):
         print(f"\nEpoch {epoch+1}/{epochs}")
         print(f"Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
@@ -451,21 +449,13 @@ def train_model(arch_name, dataset_name, data_root, model_root, seed, epochs, ba
         print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
         print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
         
-        # Track best validation accuracy
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_epoch = epoch + 1
-            print(f"*** New best validation accuracy: {best_val_acc:.2f}% at epoch {best_epoch} ***")
-    
+
     # Final test evaluation
     test_loss, test_acc = evaluate(model, test_loader, criterion, device)
     print(f"\nFinal Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%")
-    print(f"Best Val Acc: {best_val_acc:.2f}% (epoch {best_epoch})")
     
     history['test_loss'] = test_loss
     history['test_acc'] = test_acc
-    history['best_val_acc'] = best_val_acc
-    history['best_val_epoch'] = best_epoch
     
     # Save model and history
     model_dir = os.path.join(model_root, dataset_name)
@@ -476,8 +466,6 @@ def train_model(arch_name, dataset_name, data_root, model_root, seed, epochs, ba
         'model_state_dict': model.state_dict(),
         'config': history['config'],
         'epoch': epochs,
-        'best_val_acc': best_val_acc,
-        'best_val_epoch': best_epoch,
     }, model_path)
     print(f"\nModel saved to: {model_path}")
     
@@ -496,8 +484,6 @@ def save_training_plots(history, arch_name, dataset_name):
     """
 
     epochs = range(1, len(history['train_loss']) + 1)
-    best_epoch = history.get('best_val_epoch', None)
-
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     fig.suptitle(f"{arch_name} on {dataset_name}", fontsize=14, fontweight='bold')
 
@@ -586,9 +572,7 @@ if __name__ == '__main__':
             all_results[dataset] = {}
         
         all_results[dataset][model_architecture] = {
-            'test_acc': history['test_acc'],
-            'best_val_acc': history['best_val_acc'],
-            'best_val_epoch': history['best_val_epoch']
+            'test_acc': history['test_acc']
         }
     except Exception as e:
         print(f"\nError training {model_architecture} on {dataset}: {e}")
@@ -631,5 +615,4 @@ if __name__ == '__main__':
             if 'error' in result:
                 print(f"  {arch}: ERROR - {result['error']}")
             else:
-                print(f"  {arch}: Test Acc = {result['test_acc']:.2f}%, "
-                    f"Best Val Acc = {result['best_val_acc']:.2f}% (epoch {result['best_val_epoch']})")
+                print(f"  {arch}: Test Acc = {result['test_acc']:.2f}%")
