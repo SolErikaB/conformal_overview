@@ -173,11 +173,13 @@ def get_transforms(dataset_name):
     
     return transform_train, transform_val
 
-def get_datasets(dataset_name, data_root, seed=123, simulate_imbalance=False, keep_fraction=0.1):
+def get_datasets(dataset_name, data_root, seed=123, simulate_imbalance=False, keep_fraction=0.1,
+                minority_class_fraction=0.1, minority_seed=None):
     
     from torch.utils.data import ConcatDataset
     
     transform_train, transform_val = get_transforms(dataset_name)
+    minority_seed = seed if minority_seed is None else minority_seed
     
     if dataset_name == 'cifar10':
         # CIFAR-10: 32x32 RGB images, 10 classes   
@@ -260,16 +262,16 @@ def get_datasets(dataset_name, data_root, seed=123, simulate_imbalance=False, ke
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
     if simulate_imbalance and dataset_name != 'imagenet':
-        rng = np.random.default_rng(seed)
-        n_minority = max(1, int(num_classes * 0.10))          # 10% of classes
+        rng = np.random.default_rng(minority_seed)
+        n_minority = max(1, int(round(num_classes * minority_class_fraction)))
         minority_classes = set(
             rng.choice(num_classes, size=n_minority, replace=False).tolist()
         )
         print(f"[Imbalance] Minority classes ({n_minority}/{num_classes}): {sorted(minority_classes)}")
         
-        train_set = apply_class_imbalance(train_set, minority_classes, keep_fraction=0.1, seed=seed)
-        val_set   = apply_class_imbalance(val_set,   minority_classes, keep_fraction=0.1, seed=seed)
-        test_set  = apply_imbalance_to_concat(test_set, minority_classes, keep_fraction=0.1, seed=seed)
+        train_set = apply_class_imbalance(train_set, minority_classes, keep_fraction=keep_fraction, seed=seed)
+        val_set   = apply_class_imbalance(val_set,   minority_classes, keep_fraction=keep_fraction, seed=seed)
+        # Keep the test set at full coverage for CP evaluation; only calibration is reduced.
     
     return train_set, val_set, test_set, num_classes, input_size
 
@@ -369,7 +371,9 @@ def evaluate(model, loader, criterion, device):
     
     return total_loss / len(loader), 100. * correct / total
 
-def train_model(arch_name, dataset_name, data_root, model_root, seed, epochs, batch_size, learning_rate, weight_decay, num_workers):
+def train_model(arch_name, dataset_name, data_root, model_root, seed, epochs, batch_size, learning_rate, weight_decay, num_workers,
+               simulate_class_imbalance=False, minority_class_fraction=0.1, minority_keep_fraction=0.1,
+               minority_seed=None):
     """Fine-tune a model on a dataset"""
     
     print(f"\n{'='*80}")
@@ -381,7 +385,15 @@ def train_model(arch_name, dataset_name, data_root, model_root, seed, epochs, ba
     print(f"Using device: {device}")
     
     # Load data
-    train_set, val_set, test_set, num_classes, input_size = get_datasets(dataset_name, data_root, seed, simulate_imbalance=False, keep_fraction=0.1)
+    train_set, val_set, test_set, num_classes, input_size = get_datasets(
+        dataset_name,
+        data_root,
+        seed,
+        simulate_imbalance=simulate_class_imbalance,
+        keep_fraction=minority_keep_fraction,
+        minority_class_fraction=minority_class_fraction,
+        minority_seed=minority_seed,
+    )
     
     train_loader = DataLoader(train_set, batch_size=batch_size, 
                             shuffle=True, num_workers=num_workers, 
@@ -460,8 +472,9 @@ def train_model(arch_name, dataset_name, data_root, model_root, seed, epochs, ba
     # Save model and history
     model_dir = os.path.join(model_root, dataset_name)
     os.makedirs(model_dir, exist_ok=True)
-    
-    model_path = os.path.join(model_dir, f"{arch_name}.pth")
+
+    imbalance_suffix = '_imbalanced' if simulate_class_imbalance else ''
+    model_path = os.path.join(model_dir, f"{arch_name}{imbalance_suffix}.pth")
     torch.save({
         'model_state_dict': model.state_dict(),
         'config': history['config'],
@@ -472,7 +485,7 @@ def train_model(arch_name, dataset_name, data_root, model_root, seed, epochs, ba
     return history
 
 
-def save_training_plots(history, arch_name, dataset_name):
+def save_training_plots(history, arch_name, dataset_name, output_path, is_imbalanced=False):
     """
     Saves the training and validation loss plot.
 
@@ -480,7 +493,8 @@ def save_training_plots(history, arch_name, dataset_name):
         history:      the history dict produced during training
         arch_name:    e.g. "resnet18"
         dataset_name: e.g. "cifar10"
-        save_dir:     folder where plots are saved
+        output_path:  folder where plots are saved
+        is_imbalanced: boolean indicating if the dataset is imbalanced
     """
 
     epochs = range(1, len(history['train_loss']) + 1)
@@ -496,7 +510,8 @@ def save_training_plots(history, arch_name, dataset_name):
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(f"training_plot_{arch_name}_{dataset_name}.png", dpi=150, bbox_inches='tight')
+    imbalance_suffix = '_imbalanced' if is_imbalanced else ''
+    plt.savefig(f"{output_path}/training_plot_{arch_name}_{dataset_name}{imbalance_suffix}.png", dpi=150, bbox_inches='tight')
     plt.close()
 
 
@@ -519,7 +534,7 @@ if __name__ == '__main__':
     os.makedirs(model_directory, exist_ok=True)
 
     # Training hyperparameters, fine-tuning
-    epochs = 50
+    epochs = 5
     batch_size = 128
     learning_rate = 0.01
     weight_decay = 5e-4
@@ -553,7 +568,11 @@ if __name__ == '__main__':
             batch_size=batch_size,
             learning_rate=learning_rate,
             weight_decay=weight_decay,
-            num_workers=num_workers
+            num_workers=num_workers,
+            simulate_class_imbalance=config['training'].get('simulate_class_imbalance', False),
+            minority_class_fraction=config['training'].get('minority_class_fraction', 0.1),
+            minority_keep_fraction=config['training'].get('minority_keep_fraction', 0.1),
+            minority_seed=config['training'].get('imbalance_seed', seed),
         )
         
         if dataset not in all_results:
@@ -572,7 +591,8 @@ if __name__ == '__main__':
         all_results[dataset][model_architecture] = {'error': str(e)}
 
     # Save summary into a subpath based on dataset
-    summary_path = os.path.join(model_directory, dataset, f'training_summary_{model_architecture}.json')
+    imbalance_suffix = '_imbalanced' if config['training'].get('simulate_class_imbalance', False) else ''
+    summary_path = os.path.join(model_directory, dataset, f'training_summary_{model_architecture}{imbalance_suffix}.json')
     with open(summary_path, 'w') as f:
         json.dump({
             'results': all_results,
@@ -590,7 +610,13 @@ if __name__ == '__main__':
         }, f, indent=2)
 
     # Save training plots
-    save_training_plots(history, model_architecture, dataset)
+    save_training_plots(
+        history,
+        model_architecture,
+        dataset,
+        output_path = os.path.dirname(summary_path),
+        is_imbalanced=config['training'].get('simulate_class_imbalance', False),
+    )
     
     print(f"\n{'='*80}")
     print("TRAINING COMPLETE!")

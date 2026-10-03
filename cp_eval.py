@@ -79,10 +79,37 @@ class ConformalConfig:
         cp_cfg = dict(self.config['conformal_prediction'])
         cp_cfg.update(overrides)
 
+        evaluation_cfg = self.config.get('evaluation', {})
+        training_cfg = self.config.get('training', {})
+
+        def config_imbalance_flag(section):
+            if section is None:
+                return False
+            return bool(section.get('simulate_class_imbalance', False))
+
+        eval_imbalance = config_imbalance_flag(evaluation_cfg)
+        train_imbalance = config_imbalance_flag(training_cfg)
+        default_imbalance = eval_imbalance or train_imbalance
+        self.simulate_class_imbalance = bool(
+            cp_cfg.get('simulate_class_imbalance', default_imbalance)
+        )
+
         self.evaluation_dir = self.config['evaluation']['output_directory']
         self.dataset = cp_cfg['dataset']
         self.model_architecture = cp_cfg['model_architecture']
         self.mondrian = cp_cfg.get('mondrian', False)
+        self.imbalance_seed = int(cp_cfg.get('imbalance_seed', self.config['training'].get('imbalance_seed', 123)))
+        train_minority_fraction = float(self.config['training'].get('minority_class_fraction', 0.10))
+        cp_minority_fraction = cp_cfg.get('minority_class_fraction')
+        if cp_minority_fraction is not None:
+            cp_minority_fraction = float(cp_minority_fraction)
+            if not np.isclose(cp_minority_fraction, train_minority_fraction):
+                raise ValueError(
+                    "conformal_prediction.minority_class_fraction must match training.minority_class_fraction; "
+                    f"got {cp_minority_fraction} vs {train_minority_fraction}."
+                )
+        self.minority_class_fraction = train_minority_fraction
+        self.calibration_minority_fraction = float(cp_cfg.get('calibration_minority_fraction', 1.0))
         temperature = cp_cfg.get('temperature', 1.0)
         self.uses_temperature_variants = (
             self.dataset == 'imagenet' and self.model_architecture == 'resnet50'
@@ -106,14 +133,42 @@ class ConformalConfig:
                 raise ValueError("Temperature options other than 1.0 apply only to ImageNet ResNet50")
             output_suffix = ''
 
+        is_imbalanced = self.simulate_class_imbalance
+        output_suffix += '_imbalanced' if is_imbalanced else ''
+
         # Load static data once (npz is lazy; arrays are read on first use)
         output_stem = self.dataset + '_' + self.model_architecture
-        outputs_path = os.path.join(
-            self.evaluation_dir, output_stem + '_outputs' + output_suffix + '.npz'
+        non_imbalance_suffix = output_suffix[:-len('_imbalanced')] if output_suffix.endswith('_imbalanced') else output_suffix
+        balanced_outputs_path = os.path.join(
+            self.evaluation_dir, output_stem + '_outputs' + non_imbalance_suffix + '.npz'
         )
-        metrics_path = os.path.join(
-            self.evaluation_dir, output_stem + '_metrics' + output_suffix + '.npz'
+        balanced_metrics_path = os.path.join(
+            self.evaluation_dir, output_stem + '_metrics' + non_imbalance_suffix + '.npz'
         )
+        imbalanced_outputs_path = os.path.join(
+            self.evaluation_dir, output_stem + '_outputs' + non_imbalance_suffix + '_imbalanced.npz'
+        )
+        imbalanced_metrics_path = os.path.join(
+            self.evaluation_dir, output_stem + '_metrics' + non_imbalance_suffix + '_imbalanced.npz'
+        )
+
+        outputs_path = balanced_outputs_path if not is_imbalanced else imbalanced_outputs_path
+        metrics_path = balanced_metrics_path if not is_imbalanced else imbalanced_metrics_path
+
+        mismatch_ok = False
+        if is_imbalanced:
+            mismatch_ok = ((not os.path.exists(outputs_path) or not os.path.exists(metrics_path))
+                           and os.path.exists(balanced_outputs_path) and os.path.exists(balanced_metrics_path))
+        else:
+            mismatch_ok = ((not os.path.exists(outputs_path) or not os.path.exists(metrics_path))
+                           and os.path.exists(imbalanced_outputs_path) and os.path.exists(imbalanced_metrics_path))
+        if mismatch_ok:
+            raise FileNotFoundError(
+                "Requested imbalance configuration does not match the available evaluation files. "
+                f"Expected {outputs_path} and {metrics_path}, but the opposite artifact set exists instead: "
+                f"{balanced_outputs_path}/{balanced_metrics_path} vs {imbalanced_outputs_path}/{imbalanced_metrics_path}. "
+                "Set config['evaluation']['simulate_class_imbalance'] to match the file suffix on disk."
+            )
         if not os.path.exists(outputs_path) or not os.path.exists(metrics_path):
             raise FileNotFoundError(
                 "Temperature-specific output/metrics NPZs are missing: %s and %s. "
@@ -152,22 +207,58 @@ class ConformalConfig:
         return self._arrays_cache[domain]
 
     @staticmethod
-    def make_split(random_seed, data_arrays, n_calib, conformal_domain):
-        """
-        Create a random calibration/test split from a dict of plain numpy
-        arrays. Single source of truth for the split logic, used both by
-        `create_split` and by the joblib workers.
+    def _minority_class_ids(labels, minority_fraction, seed, classes=None):
+        if minority_fraction <= 0:
+            return set()
+        classes = np.unique(labels) if classes is None else np.asarray(classes)
+        n_classes = len(classes)
+        n_minority = max(1, min(n_classes, int(round(n_classes * minority_fraction))))
+        rng = np.random.default_rng(seed)
+        return set(rng.choice(classes, size=n_minority, replace=False).tolist())
 
-        Same permutation as before (so splits are unchanged), but only the
-        needed rows of the needed arrays are indexed, instead of permuting a
-        full copy of every array for every redraw.
+    @staticmethod
+    def make_split(random_seed, data_arrays, n_calib, conformal_domain,
+                   simulate_class_imbalance=False, minority_class_fraction=0.10,
+                   calibration_minority_fraction=1.0, imbalance_seed=123):
         """
-        np.random.seed(random_seed)
-        indices = np.random.permutation(len(data_arrays['labels']))
-        cal_idx, test_idx = indices[:n_calib], indices[n_calib:]
+        Create a random calibration/test split from a dict of plain numpy arrays.
+
+        If `simulate_class_imbalance` is enabled, the ordinary calibration/test
+        partition is created first. Calibration can then subsample minority-class
+        examples within its fixed partition; the test indices remain unchanged.
+        """
+        labels = data_arrays['labels']
+
+        rng = np.random.RandomState(random_seed)
+        indices = rng.permutation(len(labels))
+        calibration_pool_idx = indices[:n_calib]
+        test_idx = indices[n_calib:]
+
+        if simulate_class_imbalance:
+            minority_classes = ConformalConfig._minority_class_ids(
+                labels,
+                minority_class_fraction,
+                imbalance_seed,
+                classes=np.arange(data_arrays['probabilities'].shape[1]),
+            )
+            calib_labels = labels[calibration_pool_idx]
+            is_minority = np.isin(calib_labels, list(minority_classes))
+            keep_mask = ~is_minority
+
+            for minority_class in minority_classes:
+                class_positions = np.flatnonzero(calib_labels == minority_class)
+                n_keep = int(round(calibration_minority_fraction * len(class_positions)))
+                n_keep = min(len(class_positions), max(0, n_keep))
+                keep_mask[class_positions] = False
+                if n_keep:
+                    selected_positions = rng.choice(class_positions, size=n_keep, replace=False)
+                    keep_mask[selected_positions] = True
+
+            cal_idx = calibration_pool_idx[keep_mask]
+        else:
+            cal_idx = calibration_pool_idx
 
         domain = data_arrays[conformal_domain]
-        labels = data_arrays['labels']
         probs = data_arrays['probabilities']
 
         return {
@@ -180,7 +271,16 @@ class ConformalConfig:
 
     def create_split(self, random_seed):
         """Create a random calibration/test split using this config's own data"""
-        return self.make_split(random_seed, self._needed_arrays(), self.n_calib, self.conformal_domain)
+        return self.make_split(
+            random_seed,
+            self._needed_arrays(),
+            self.n_calib,
+            self.conformal_domain,
+            simulate_class_imbalance=self.simulate_class_imbalance,
+            minority_class_fraction=self.minority_class_fraction,
+            calibration_minority_fraction=self.calibration_minority_fraction,
+            imbalance_seed=self.imbalance_seed,
+        )
 
     # ---- Worker payload ------------------------------------------------
 
@@ -190,9 +290,19 @@ class ConformalConfig:
         dict. Reads the current attribute values, so mutating
         conf.score_function / conf.distance_metric between calls works.
         """
+        data_arrays = self._needed_arrays()
+        minority_class_ids = (
+            self._minority_class_ids(
+                data_arrays['labels'],
+                self.minority_class_fraction,
+                self.imbalance_seed,
+                classes=np.arange(data_arrays['probabilities'].shape[1]),
+            )
+            if self.simulate_class_imbalance else set()
+        )
         return {
             'alpha': self.alpha,
-            'data_arrays': self._needed_arrays(),
+            'data_arrays': data_arrays,
             'n_classes': self.n_classes,
             'distance_metric': self.distance_metric,
             'score_function': self.score_function,
@@ -205,6 +315,11 @@ class ConformalConfig:
             'conformal_domain': self.conformal_domain,
             'dataset': self.dataset,
             'model_architecture': self.model_architecture,
+            'simulate_class_imbalance': self.simulate_class_imbalance,
+            'minority_class_fraction': self.minority_class_fraction,
+            'calibration_minority_fraction': self.calibration_minority_fraction,
+            'imbalance_seed': self.imbalance_seed,
+            'minority_class_ids': minority_class_ids,
         }
 
 
@@ -311,6 +426,10 @@ def compute_iteration(random_seed, conf_data):
         conf_data['data_arrays'],
         conf_data['n_calib'],
         conf_data['conformal_domain'],
+        simulate_class_imbalance=conf_data.get('simulate_class_imbalance', False),
+        minority_class_fraction=conf_data.get('minority_class_fraction', 0.10),
+        calibration_minority_fraction=conf_data.get('calibration_minority_fraction', 1.0),
+        imbalance_seed=conf_data.get('imbalance_seed', 123),
     )
 
     return find_S_single_iteration(
@@ -580,6 +699,10 @@ def compute_prevalence_iteration(random_seed, conf_data):
         conf_data['data_arrays'],
         conf_data['n_calib'],
         conf_data['conformal_domain'],
+        simulate_class_imbalance=conf_data.get('simulate_class_imbalance', False),
+        minority_class_fraction=conf_data.get('minority_class_fraction', 0.10),
+        calibration_minority_fraction=conf_data.get('calibration_minority_fraction', 1.0),
+        imbalance_seed=conf_data.get('imbalance_seed', 123),
     )
 
     results_df = run_cp_once(
@@ -595,8 +718,6 @@ def compute_prevalence_iteration(random_seed, conf_data):
         conf_data['mondrian'],
         conf_data['reg_k'],
         conf_data['reg_lambda'],
-        parallel=False,
-        n_workers=1,
         model_architecture=conf_data['model_architecture'],
         dataset=conf_data['dataset']
     )
@@ -610,7 +731,9 @@ def compute_prevalence_iteration(random_seed, conf_data):
         conf_data['n_classes']
     )
 
-    return evaluator.prevalence_of_minority_classes()
+    return evaluator.prevalence_of_minority_classes(
+        conf_data.get('minority_class_ids', set())
+    )
 
 
 def compute_prevalence_of_minority_classes(n_iterations):
@@ -697,15 +820,19 @@ class ConformalPredictionEvaluator():
 
             return overall_accuracy, overall_avg_size
 
-    def prevalence_of_minority_classes(self):
+    def prevalence_of_minority_classes(self, minority_classes):
+        """Compare prediction-region prevalence for the configured minority classes.
 
-        counts = self.results_df["label"].value_counts()
-        max_count = counts.max()
-        minority_classes = counts[counts < 0.3 * max_count].index.tolist()
-
-        if not minority_classes:
+        Minority class identities come from the seeded imbalance configuration,
+        not from observed label frequencies, which may vary with the calibration
+        sampling fraction.
+        """
+        minority_classes = set(minority_classes)
+        print(f"Evaluating prevalence of minority classes: {minority_classes}")
+        if not minority_classes or self.results_df.empty:
             return 0.0, 0.0
 
+        labels = self.results_df['label'].to_numpy()
         prediction_regions = self.results_df['prediction_region'].tolist()
         n_regions = len(prediction_regions)
 
@@ -721,7 +848,7 @@ class ConformalPredictionEvaluator():
         true_proportions = []
         expected_proportions = []
         for minority_class in minority_classes:
-            expected_proportions.append(counts[minority_class] / counts.sum())
+            expected_proportions.append(np.mean(labels == minority_class))
             true_proportions.append(class_region_counts.get(minority_class, 0) / n_regions)
 
         return float(np.mean(true_proportions)), float(np.mean(expected_proportions))
@@ -761,4 +888,49 @@ class ConformalPredictionEvaluator():
 
 if __name__ == "__main__":
 
-    run_all(n_iterations=100)
+    # Do a quick minority-class prevalence check to verify that the imbalance simulation is working as expected.
+    # n_iterations = 100
+    # median_true_proportion, median_expected_proportion = compute_prevalence_of_minority_classes(n_iterations)
+    # print(f"Median true proportion of minority classes in prediction regions: {median_true_proportion:.4f}")
+    # print(f"Median expected proportion of minority classes in the dataset: {median_expected_proportion:.4f}")
+
+    # Run CP once
+    conf = ConformalConfig()
+    split = conf.create_split(random_seed=42)
+    results_df = run_cp_once(
+        conf.alpha,
+        split['calibration_data'],
+        split['calibration_labels'],
+        split['calibration_preds'],
+        split['test_data'],
+        split['test_labels'],
+        conf.n_classes,
+        conf.distance_metric,
+        conf.score_function,
+        conf.mondrian,
+        conf.reg_k,
+        conf.reg_lambda,
+        model_architecture=conf.model_architecture,
+        dataset=conf.dataset
+    )
+
+    evaluator = ConformalPredictionEvaluator(
+        results_df,
+        conf.score_function,
+        conf.distance_metric,
+        conf.alpha,
+        conf.mondrian,
+        conf.n_classes
+    )
+
+    # Get accuracy metrics
+    overall_accuracy, overall_avg_size = evaluator.get_accuracy(mondrian=conf.mondrian, print_acc=True)
+
+    true_proportions, expected_proportions = evaluator.prevalence_of_minority_classes(conf._minority_class_ids(
+        conf._needed_arrays()['labels'],
+        conf.minority_class_fraction,
+        conf.imbalance_seed,
+        classes=np.arange(conf._needed_arrays()['probabilities'].shape[1]),
+    ))
+    print(f"Median true proportion of minority classes in prediction regions: {true_proportions:.4f}")
+    print(f"Median expected proportion of minority classes in the dataset: {expected_proportions:.4f}")
