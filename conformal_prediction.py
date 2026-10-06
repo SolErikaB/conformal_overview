@@ -201,13 +201,14 @@ class KMeans3DistanceScore(DistanceMetric):
 class RAPS(DistanceMetric):
     """Nonconformity score using Regularized Adaptive Prediction Sets."""
     
-    def __init__(self, distance_metric, n_classes, reg_k, reg_lambda):
+    def __init__(self, distance_metric, n_classes, reg_k, reg_lambda, u=0.001):
         super().__init__(distance_metric)
         self.n_classes = n_classes
         self.reg_k = reg_k
         self.reg_lambda = reg_lambda
+        self.u = u
         
-    def compute_score(self, datapoint, label):
+    def compute_score(self, datapoint, label, u=None):
 
         target = datapoint[label]
 
@@ -217,32 +218,36 @@ class RAPS(DistanceMetric):
 
         E = np.sum(datapoint[mask]) if r > 1 else 0
 
-        #u = np.random.uniform(0, 1)
-        u = 0.001
+        if u is None:
+            u = self.u
+        if u is None:
+            u = np.random.uniform(0, 1)
+        
         score = E + u * datapoint[label] + self.reg_lambda * max(r-self.reg_k,0)
 
-#        if r<=2:
-#            print(E, datapoint[label], r, max(r-self.reg_k,0), score)
         return score
 
 
 class SAPS(DistanceMetric):
     """Nonconformity score using Regularized Adaptive Prediction Sets."""
     
-    def __init__(self, distance_metric, n_classes, reg_lambda):
+    def __init__(self, distance_metric, n_classes, reg_lambda, u=0.001):
         super().__init__(distance_metric)
         self.n_classes = n_classes
         self.reg_lambda = reg_lambda
+        self.u = u
 
-    def compute_score(self, datapoint, label):
+    def compute_score(self, datapoint, label, u=None):
         
         target = datapoint[label]
 
         r = np.sum(datapoint > target) + 1
         biggest_score = np.max(datapoint)
 
-        u = np.random.uniform(0, 1)
-        #u = 0.001
+        if u is None:
+            u = self.u
+        if u is None:
+            u = np.random.uniform(0, 1)
 
         if r == 1:
             E = u * biggest_score
@@ -434,6 +439,7 @@ class NonconformityScore:
                  n_clusters=None,
                  reg_k=2,
                  reg_lambda=3,
+                 u=0.001,
                  model_architecture=None,
                  dataset=None):
         """
@@ -449,6 +455,7 @@ class NonconformityScore:
         self.distance_metric = distance_metric
         self.mondrian = mondrian
         self.n_clusters = n_clusters
+        self.u = u
         
         if score_function == 'label':
             self.nonconformity_score = LabelDistanceScore(distance_metric, n_classes=n_classes)
@@ -471,10 +478,21 @@ class NonconformityScore:
             score_function = 'raps'
 
         if score_function == 'raps':
-            self.nonconformity_score = RAPS(distance_metric, n_classes=n_classes, reg_k=reg_k, reg_lambda=reg_lambda)
+            self.nonconformity_score = RAPS(
+                distance_metric,
+                n_classes=n_classes,
+                reg_k=reg_k,
+                reg_lambda=reg_lambda,
+                u=u,
+            )
 
         if score_function == 'saps':
-            self.nonconformity_score = SAPS(distance_metric, n_classes=n_classes, reg_lambda=reg_lambda)
+            self.nonconformity_score = SAPS(
+                distance_metric,
+                n_classes=n_classes,
+                reg_lambda=reg_lambda,
+                u=u,
+            )
 
         if score_function == 'gradient':
             self.nonconformity_score = GradientDistanceScore(distance_metric, n_classes=n_classes, model_architecture=model_architecture, dataset=dataset)
@@ -501,6 +519,8 @@ class ConformalPrediction(NonconformityScore):
                  mondrian,
                  reg_k=2,
                  reg_lambda=3,
+                 u=0.001,
+                 random_state=None,
                  model_architecture=None,
                  dataset=None
                  ):
@@ -517,6 +537,7 @@ class ConformalPrediction(NonconformityScore):
             mondrian=mondrian,
             reg_k=reg_k,
             reg_lambda=reg_lambda,
+            u=u,
             model_architecture=model_architecture,
             dataset=dataset
         )
@@ -524,6 +545,8 @@ class ConformalPrediction(NonconformityScore):
         self.alpha = alpha
         self.reg_k = reg_k
         self.reg_lambda = reg_lambda
+        self.u = u
+        self.random_state = random_state
 
         self.calibration_df = None
         self.results_df = None
@@ -542,11 +565,26 @@ class ConformalPrediction(NonconformityScore):
         """
         # --- Calibration scores ---
         distances = []
+        uses_random_u = self.score_function in ('raps', 'saps') and self.u is None
+        if uses_random_u:
+            rng = np.random.default_rng(self.random_state)
+            calibration_u = rng.uniform(size=len(self.calibration_data))
+            test_u = rng.uniform(size=len(self.test_data))
+        else:
+            calibration_u = test_u = None
+
         for i in range(len(self.calibration_data)):
             data_point = self.calibration_data[i]
+            randomized_score_kwargs = (
+                {'u': calibration_u[i]} if uses_random_u else {}
+            )
             if self.score_function in ['mean', 'kmeans3']:
                 d = self.nonconformity_score.compute_score(
                     data_point, self.calibration_labels[i], exclude_datapoint=True
+                )
+            elif self.score_function in ('raps', 'saps'):
+                d = self.nonconformity_score.compute_score(
+                    data_point, self.calibration_labels[i], **randomized_score_kwargs
                 )
             else:
                 d = self.nonconformity_score.compute_score(data_point, self.calibration_labels[i])
@@ -569,8 +607,11 @@ class ConformalPrediction(NonconformityScore):
         test_scores = np.empty((n_test, self.n_classes))
         for i in range(n_test):
             data_point = self.test_data[i]
+            randomized_score_kwargs = {'u': test_u[i]} if uses_random_u else {}
             for c in range(self.n_classes):
-                test_scores[i, c] = self.nonconformity_score.compute_score(data_point, c)
+                test_scores[i, c] = self.nonconformity_score.compute_score(
+                    data_point, c, **randomized_score_kwargs
+                )
 
         self._test_scores = test_scores
         self._scores_computed = True

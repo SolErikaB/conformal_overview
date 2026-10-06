@@ -36,12 +36,6 @@ GRADIENT_DISTANCES = ['euclidean']
 
 MONDRIAN_VALUES = [False]
 
-# Small defaults for a quick regularization sweep; pass custom grids to
-# run_regularization_sweep() for a finer search.
-RAPS_REG_K_GRID = [1,2,3]
-RAPS_REG_LAMBDA_GRID = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
-SAPS_REG_LAMBDA_GRID = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
-
 SCORE_SPECS = {
     'label':         (LABEL_DOMAINS, DISTANCES),
     'mean':          (DOMAINS, DISTANCES),
@@ -185,6 +179,7 @@ class ConformalConfig:
         self.alpha = cp_cfg['alpha']
         self.reg_k = cp_cfg['reg_k']
         self.reg_lambda = cp_cfg['reg_lambda']
+        self.u = cp_cfg.get('u', 0.001)
         self.n_workers = cp_cfg['n_workers']
 
         # Load metrics
@@ -309,6 +304,7 @@ class ConformalConfig:
             'mondrian': self.mondrian,
             'reg_k': self.reg_k,
             'reg_lambda': self.reg_lambda,
+            'u': self.u,
             'top1_accuracy': self.top1_accuracy,
             'top5_accuracy': self.top5_accuracy,
             'n_calib': self.n_calib,
@@ -336,7 +332,8 @@ def run_parallel_iterations(conf, worker_fn, n_iterations, desc):
 
 
 def run_cp_once(alpha, calibration_data, calibration_labels, calibration_preds, test_data, test_labels,
-                n_classes, distance_metric, score_function, mondrian, reg_k, reg_lambda, model_architecture, dataset):
+                n_classes, distance_metric, score_function, mondrian, reg_k, reg_lambda,
+                model_architecture, dataset, u=0.001, random_state=None):
 
     cp = ConformalPrediction(
         alpha=alpha,
@@ -351,6 +348,8 @@ def run_cp_once(alpha, calibration_data, calibration_labels, calibration_preds, 
         mondrian=mondrian,
         reg_k=reg_k,
         reg_lambda=reg_lambda,
+        u=u,
+        random_state=random_state,
         model_architecture=model_architecture,
         dataset=dataset
     )
@@ -389,7 +388,7 @@ def cumulative_S(cp, breakpoints, chunk_size=2000):
 def find_S_single_iteration(alpha, calibration_data, calibration_labels, calibration_preds,
                             test_data, test_labels, n_classes, distance_metric,
                             score_function, mondrian, reg_k, reg_lambda, top1_accuracy,
-                            model_architecture=None, dataset=None):
+                            model_architecture=None, dataset=None, u=0.001, random_state=None):
     """
     Truncated S for every window, for one calibration/test split.
     Returns {window_label: raw integral of mean set size over the window}.
@@ -410,6 +409,8 @@ def find_S_single_iteration(alpha, calibration_data, calibration_labels, calibra
         mondrian=mondrian,
         reg_k=reg_k,
         reg_lambda=reg_lambda,
+        u=u,
+        random_state=random_state,
         model_architecture=model_architecture,
         dataset=dataset
     )
@@ -447,7 +448,9 @@ def compute_iteration(random_seed, conf_data):
         conf_data['reg_lambda'],
         conf_data['top1_accuracy'],
         model_architecture=conf_data['model_architecture'],
-        dataset=conf_data['dataset']
+        dataset=conf_data['dataset'],
+        u=conf_data.get('u', 0.001),
+        random_state=random_seed,
     )
 
 
@@ -719,7 +722,9 @@ def compute_prevalence_iteration(random_seed, conf_data):
         conf_data['reg_k'],
         conf_data['reg_lambda'],
         model_architecture=conf_data['model_architecture'],
-        dataset=conf_data['dataset']
+        dataset=conf_data['dataset'],
+        u=conf_data.get('u', 0.001),
+        random_state=random_seed,
     )
 
     evaluator = ConformalPredictionEvaluator(
