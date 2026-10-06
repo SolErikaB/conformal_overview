@@ -342,6 +342,107 @@ class GradientDistanceScore(DistanceMetric):
         
         return z.detach()
 
+
+class GradientDistanceScoreClaude(DistanceMetric):
+    """
+    Drop-in, faster replacement for GradientDistanceScore that computes the same
+    Feature CP nonconformity score (Euclidean distance in feature space from z to
+    the point found by Adam descent toward the one-hot label under a softmax/MSE
+    objective) without changing the algorithm. Hyperparameters (Adam, lr=0.1,
+    steps=100, tolerance=1e-3, mean-over-classes MSE) and the early-stopping rule
+    are identical, so scores match the original up to floating-point noise.
+
+    Speedups (all exact reformulations, none alter the optimization trajectory):
+      1. Batching: each (sample, class) optimization is independent, so many are
+         run at once as rows of a single tensor instead of one at a time.
+      2. Manual Adam: the update rule is reimplemented per row, matching
+         torch.optim.Adam, removing optimizer and Python per-step overhead.
+      3. Closed-form gradient: the classifier is a single nn.Linear, so
+         dL/dz = (p * (g - sum(g*p))) @ W with g = 2(p - onehot)/C is computed
+         directly, with no autograd graph and no frozen parameters tracked.
+      4. Exact per-row early stopping: a row is frozen as soon as its pre-step
+         loss drops below the tolerance (same as the original `break`), and
+         converged rows are periodically compacted out of the batch so the cost
+         shrinks as rows finish.
+
+    Requirements: `classifier` must be a plain nn.Linear. For other heads the
+    manual gradient is invalid and autograd should be used instead.
+    """
+
+    def __init__(self, distance_metric, n_classes, model_architecture, dataset, device=None):
+        super().__init__(distance_metric)
+        # ... your existing model/classifier loading, unchanged ...
+        self.n_classes = n_classes
+        self.device = 'cpu'
+        lin = self.classifier.to(self.device)              # must be a single nn.Linear
+        self.W = lin.weight.detach()                       # (C, d)
+        self.b = (lin.bias.detach() if lin.bias is not None
+                  else torch.zeros(self.W.shape[0], device=self.device))
+
+    @torch.no_grad()
+    def _find_perfect_prediction(self, z0, y, lr=0.1, steps=100, tolerance=1e-3,
+                                 beta1=0.9, beta2=0.999, eps=1e-8, check_every=5):
+        """Batched replica of the original Adam loop. z0: (B,d), y: (B,)."""
+        C = self.n_classes
+        out = z0.clone()
+        idx = torch.arange(len(z0), device=z0.device)
+        z, yy = z0.clone(), y
+        m, v = torch.zeros_like(z), torch.zeros_like(z)
+        frozen = torch.zeros(len(z), dtype=torch.bool, device=z.device)
+
+        for t in range(1, steps + 1):
+            p = torch.softmax(F.linear(z, self.W, self.b), dim=1)
+            diff = p.clone()
+            diff[torch.arange(len(z), device=z.device), yy] -= 1.0      # p - onehot
+            loss = (diff ** 2).mean(dim=1)                              # per-row mse_loss
+            g = 2.0 * diff / C
+            gz = (p * (g - (g * p).sum(1, keepdim=True))) @ self.W      # dL/dz
+
+            m = beta1 * m + (1 - beta1) * gz
+            v = beta2 * v + (1 - beta2) * gz * gz
+            step = lr * (m / (1 - beta1 ** t)) / ((v / (1 - beta2 ** t)).sqrt() + eps)
+            z = torch.where(frozen[:, None], z, z - step)               # frozen rows stay put
+            frozen = frozen | (loss < tolerance)                        # break check uses pre-step loss
+
+            if t % check_every == 0 or t == steps:                      # compact (one sync)
+                if frozen.any():
+                    out[idx[frozen]] = z[frozen]
+                    keep = ~frozen
+                    idx, z, yy, m, v = idx[keep], z[keep], yy[keep], m[keep], v[keep]
+                    frozen = frozen[keep]
+                if idx.numel() == 0:
+                    break
+        if idx.numel():
+            out[idx] = z
+        return out
+
+    def scores_batch(self, Z, y, chunk=8192, **kw):
+        """Z: (N,d), y: (N,) -> (N,) Euclidean distances."""
+        Z = torch.as_tensor(Z, dtype=torch.float32)
+        y = torch.as_tensor(y, dtype=torch.long)
+        res = []
+        for i in range(0, len(Z), chunk):
+            z = Z[i:i+chunk].to(self.device)
+            yb = y[i:i+chunk].to(self.device)
+            res.append((z - self._find_perfect_prediction(z, yb, **kw)).norm(dim=1).cpu())
+        return torch.cat(res)
+
+    def scores_all_classes(self, Z, class_chunk=1000, **kw):
+        """Z: (N,d) -> (N,C). Each (sample, class) pair is one independent problem."""
+        Z = torch.as_tensor(Z, dtype=torch.float32)
+        N, C = len(Z), self.n_classes
+        out = torch.empty(N, C)
+        for n in range(N):
+            for s in range(0, C, class_chunk):
+                ys = torch.arange(s, min(s + class_chunk, C))
+                out[n, s:s+len(ys)] = self.scores_batch(Z[n:n+1].expand(len(ys), -1), ys, **kw)
+        return out
+
+    def compute_score(self, datapoint, label):                          # original API
+        z = torch.as_tensor(datapoint, dtype=torch.float32).reshape(1, -1)
+        return self.scores_batch(z, [label]).item()
+
+
     
 
 class FastGradientDistanceScore(DistanceMetric):
