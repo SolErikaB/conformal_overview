@@ -1,6 +1,7 @@
 from conformal_prediction import *
 import joblib
 import copy
+import time
 from collections import Counter
 
 # ---------------------------------------------------------------------------
@@ -562,9 +563,11 @@ def add_row_to_S_table(n_iterations, conf=None):
     spec = spec_from_conf(conf)
     key = table_key(spec)
 
+    computation_start = time.perf_counter()
     results = run_parallel_iterations(
         conf, compute_iteration, n_iterations, desc=describe(spec)
     )
+    computation_time_seconds = time.perf_counter() - computation_start
 
     S_matrix = np.array([[r[label] for label in WINDOW_LABELS] for r in results])
 
@@ -585,6 +588,7 @@ def add_row_to_S_table(n_iterations, conf=None):
              lower=bp[lo],
              upper=bp[hi],
              n_iterations=n_iterations,
+             computation_time_seconds=computation_time_seconds,
              **summarise(S_per_unit_window[:, j]))
         for j, (lo, hi) in enumerate(WINDOWS)
     ])
@@ -597,6 +601,7 @@ def add_row_to_S_table(n_iterations, conf=None):
     i1_row = new_df.loc[new_df['window'] == '0-e'].iloc[0]
     print("Median S per unit window (0, 1): %.4f   |   (0, e) [I_1-style]: %.4f"
         % (full, i1_row['S_median']), flush=True)
+    print("Computation time: %.3f seconds" % computation_time_seconds, flush=True)
 
     return WINDOW_LABELS, S_matrix
 
