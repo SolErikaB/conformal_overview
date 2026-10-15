@@ -5,6 +5,8 @@ import pandas as pd
 import prepare_models
 from model_eval_and_save_features import FeatureExtractorWrapper
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 with open("config.yaml", 'r') as f:
@@ -371,13 +373,55 @@ class GradientDistanceScoreClaude(DistanceMetric):
 
     def __init__(self, distance_metric, n_classes, model_architecture, dataset, device=None):
         super().__init__(distance_metric)
-        # ... your existing model/classifier loading, unchanged ...
+
+        self.n_classes = n_classes
+
+        # Remove trailing "_imbalanced" from dataset name if present
+        if dataset.endswith('_imbalanced'):
+            dataset = dataset[:-len('_imbalanced')]
+    
+        data_dir = config['training']['data_directory']
+        model_dir = config['training']['model_directory']
+        self.device = torch.device('cpu')
+
+        _, _, _, num_classes, input_size = prepare_models.get_datasets(dataset, data_dir, seed=123)
+
+        # Load model
+        model = prepare_models.get_model(model_architecture, dataset, num_classes, input_size)
+        model_path = os.path.join(model_dir, dataset, f"{model_architecture}.pth")
+        if dataset != 'imagenet':
+            checkpoint = torch.load(model_path, map_location=self.device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+
+        wrapped_model = FeatureExtractorWrapper(model, model_architecture)
+        self.model = wrapped_model.to(self.device)
+        self.model.eval()
+
         self.n_classes = n_classes
         self.device = 'cpu'
-        lin = self.classifier.to(self.device)              # must be a single nn.Linear
-        self.W = lin.weight.detach()                       # (C, d)
+        
+        self.classifier = wrapped_model.classifier.to(self.device).eval()
+        lin = self._extract_linear(self.classifier)
+        self.W = lin.weight.detach()
         self.b = (lin.bias.detach() if lin.bias is not None
-                  else torch.zeros(self.W.shape[0], device=self.device))
+                else torch.zeros(self.W.shape[0], device=self.device))
+
+
+    @staticmethod
+    def _extract_linear(classifier):
+        """Return the single nn.Linear inside `classifier`, allowing only layers
+        that are the identity at eval time (Dropout/Identity/Flatten)."""
+        if isinstance(classifier, nn.Linear):
+            return classifier
+        inner = [m for m in classifier.modules() if m is not classifier]
+        linears = [m for m in inner if isinstance(m, nn.Linear)]
+        others = [m for m in inner
+                if not isinstance(m, (nn.Linear, nn.Dropout, nn.Identity, nn.Flatten))]
+        if len(linears) != 1 or others:
+            raise ValueError(
+                f"Classifier is not a single Linear (+ identity-at-eval layers): "
+                f"{classifier}. The closed-form gradient is invalid here.")
+        return linears[0]
 
     @torch.no_grad()
     def _find_perfect_prediction(self, z0, y, lr=0.1, steps=100, tolerance=1e-3,
@@ -596,7 +640,7 @@ class NonconformityScore:
             )
 
         if score_function == 'gradient':
-            self.nonconformity_score = GradientDistanceScore(distance_metric, n_classes=n_classes, model_architecture=model_architecture, dataset=dataset)
+            self.nonconformity_score = GradientDistanceScoreClaude(distance_metric, n_classes=n_classes, model_architecture=model_architecture, dataset=dataset)
 
         if score_function == 'fast_gradient':
             self.nonconformity_score = FastGradientDistanceScore(distance_metric, n_classes=n_classes, model_architecture=model_architecture, dataset=dataset)
