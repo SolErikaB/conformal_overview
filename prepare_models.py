@@ -1,5 +1,5 @@
 """
-Script which fine-tunes ImageNet pretrained models on CIFAR-10, CIFAR-100, and Fashion-MNIST,
+Script which fine-tunes ImageNet pretrained models on CIFAR-10 and CIFAR-100,
 or simply loads the ImageNet model for ImageNet (2012) classification. 
 """
 
@@ -133,24 +133,6 @@ def get_transforms(dataset_name):
                                std=[0.2675, 0.2565, 0.2761])
         ])
         
-    elif dataset_name == 'fashionmnist':
-        # Fashion-MNIST: convert to RGB
-        transform_train = transforms.Compose([
-            transforms.RandomCrop(28, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.Grayscale(num_output_channels=3),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], 
-                               std=[0.5, 0.5, 0.5])
-        ])
-        
-        transform_val = transforms.Compose([
-            transforms.Grayscale(num_output_channels=3),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], 
-                               std=[0.5, 0.5, 0.5])
-        ])
-
     elif dataset_name == 'imagenet':
         # ImageNet normalization - CRITICAL for pretrained models!
         transform_train = transforms.Compose([
@@ -222,27 +204,6 @@ def get_datasets(dataset_name, data_root, seed=123, simulate_imbalance=False, ke
         num_classes = 100
         input_size = 32
         
-    elif dataset_name == 'fashionmnist':
-        # Fashion-MNIST: 28x28 grayscale images, 10 classes
-        full_train = datasets.FashionMNIST(root=data_root, train=True, download=True, transform=transform_train)
-        official_test = datasets.FashionMNIST(root=data_root, train=False, download=True, transform=transform_val)
-        
-        # For Fashion-MNIST: 60k total, so 30k/20k/10k split
-        train_set, val_set, extra_test_set = random_split(
-            full_train, [30000, 20000, 10000], 
-            generator=torch.Generator().manual_seed(seed)
-        )
-        
-        val_full = datasets.FashionMNIST(root=data_root, train=True, download=True, transform=transform_val)
-        val_set.dataset = val_full
-        extra_test_set.dataset = val_full
-
-        # Combine 10k extra_test with 10k official test = 20k test set
-        test_set = ConcatDataset([extra_test_set, official_test])
-
-        num_classes = 10
-        input_size = 28
-
     elif dataset_name == 'imagenet':
         # ImageNet: 224x224 RGB images, 1000 classes
         # This requires downloading the ImageNet 2012 dataset separately
@@ -534,7 +495,7 @@ if __name__ == '__main__':
     os.makedirs(model_directory, exist_ok=True)
 
     # Training hyperparameters, fine-tuning
-    epochs = 5
+    epochs = 50
     batch_size = 128
     learning_rate = 0.01
     weight_decay = 5e-4
