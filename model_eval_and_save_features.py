@@ -178,12 +178,14 @@ def fit_temperature(logits, labels):
 
 
 def save_temperature_variants(results, save_dir, dataset, model_architecture,
-                              temperatures=(0.5, 1.0, 2.0, 4.0),
+                              temperatures=(0.5, 2.0, 4.0),
                               fit_holdout_size=10000, random_seed=42,
                               is_imbalanced=False):
     """Save per-temperature NPZs for ImageNet ResNet50.
 
-    Fixed-T files include all evaluation examples. The calibrated file fits T
+    Fixed-T files include all evaluation examples. In every variant file only `probabilities`
+    depend on T; `logits` are the raw, unscaled logits, so logit-domain CP is independent of T.
+    The calibrated file fits T
     on a deterministic 10k holdout and contains only the remaining CP examples.
     """
     if dataset != "imagenet" or model_architecture != "resnet50":
@@ -199,16 +201,15 @@ def save_temperature_variants(results, save_dir, dataset, model_architecture,
     def save_variant(temperature, indices, tag, fit_indices=None):
         selected_logits = logits[indices]
         scaled_logits = selected_logits.astype(np.float64) / temperature
-        scaled_logits -= scaled_logits.max(axis=1, keepdims=True)
-        exp_logits = np.exp(scaled_logits)
+        shifted_logits = scaled_logits - scaled_logits.max(axis=1, keepdims=True)
+        exp_logits = np.exp(shifted_logits)
         probabilities = exp_logits / exp_logits.sum(axis=1, keepdims=True)
 
         imbalance_suffix = '_imbalanced' if is_imbalanced else ''
         stem = "%s_%s" % (dataset, model_architecture)
         outputs_path = os.path.join(save_dir, f"{stem}_outputs_T_{tag}{imbalance_suffix}.npz")
         payload = {
-            "logits": scaled_logits,
-            "raw_logits": selected_logits,
+            "logits": selected_logits,
             "probabilities": probabilities,
             "features": features[indices],
             "labels": labels[indices],
@@ -232,8 +233,8 @@ def save_temperature_variants(results, save_dir, dataset, model_architecture,
     all_indices = np.arange(n_samples)
     for temperature in temperatures:
         temperature = float(temperature)
-        if temperature <= 0:
-            raise ValueError("Temperatures must be positive")
+        if temperature <= 0 or temperature == 1.0:
+            raise ValueError("Variant temperatures must be positive and differ from 1 (T=1 is the plain outputs file)")
         tag = str(temperature).replace(".", "_")
         save_variant(temperature, all_indices, tag)
 
@@ -341,20 +342,10 @@ if __name__ == "__main__":
         model_path = os.path.join(
             model_dir, dataset, f"{model_architecture}{imbalance_suffix}.pth"
         )
-        opposite_suffix = '' if is_imbalanced else '_imbalanced'
-        opposite_model_path = os.path.join(
-            model_dir, dataset, f"{model_architecture}{opposite_suffix}.pth"
-        )
-        if not os.path.exists(model_path) and os.path.exists(opposite_model_path):
-            raise FileNotFoundError(
-                f"Evaluation is configured for {'imbalanced' if is_imbalanced else 'balanced'} data, "
-                f"so it expects checkpoint {model_path!r}; only the opposite-mode checkpoint exists: "
-                f"{opposite_model_path!r}. Check evaluation.simulate_class_imbalance and the checkpoint name."
-            )
         if not os.path.exists(model_path):
             raise FileNotFoundError(
                 f"Model checkpoint not found: {model_path}. "
-                "Check evaluation.simulate_class_imbalance and train/save the matching model first."
+                "Check evaluation.simulate_class_imbalance and train the matching model first."
             )
         print(f"Model path: {model_path}")
         
@@ -376,20 +367,16 @@ if __name__ == "__main__":
     metrics = compute_metrics(results)
     
     # Save results
-    output_dir = config.get('evaluation', {}).get('output_directory', './evaluation_outputs')
-    save_path = save_results(results, output_dir, dataset, model_architecture, is_imbalanced=is_imbalanced)
+    output_dir = config['evaluation']['output_directory']
+    save_results(results, output_dir, dataset, model_architecture, is_imbalanced=is_imbalanced)
 
     if dataset == 'imagenet' and model_architecture == 'resnet50':
         save_temperature_variants(results, output_dir, dataset, model_architecture, is_imbalanced=is_imbalanced)
 
-    # Optional: Save metrics separately
+    # Save metrics separately
     suffix = '_imbalanced' if is_imbalanced else ''
     metrics_path = os.path.join(output_dir, f"{dataset}_{model_architecture}_metrics{suffix}.npz")
     np.savez(metrics_path, **metrics)
     print(f"\nSaved metrics to: {metrics_path}")
     
     print("\nEvaluation complete!")
-    print(f"\nTo load results later:")
-    print(f"  data = np.load('{save_path}')")
-    print(f"  logits = data['logits']")
-    print(f"  features = data['features']")
