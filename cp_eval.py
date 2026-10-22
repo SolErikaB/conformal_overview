@@ -1,8 +1,11 @@
-from conformal_prediction import *
+import os
+import yaml
 import joblib
-import copy
+import numpy as np
+import pandas as pd
 import time
-from collections import Counter
+
+from conformal_prediction import ConformalPrediction
 
 # ---------------------------------------------------------------------------
 # Truncation windows
@@ -20,7 +23,7 @@ WINDOWS = [(BREAKPOINT_NAMES[i], BREAKPOINT_NAMES[j])
 WINDOW_LABELS = [lo + '-' + hi for lo, hi in WINDOWS]
 
 # ---------------------------------------------------------------------------
-# Sweep grid for run_all()  -- EDIT THIS to match the experiments you want
+# Sweep grid for run_all().
 # ---------------------------------------------------------------------------
 DATASETS = ['cifar10', 'cifar100', 'imagenet']
 MODELS = ['resnet50', 'resnet18', 'efficientnet_b0', 'vit_b_16']
@@ -48,11 +51,26 @@ SCORE_SPECS = {
     'saps':          (APS_DOMAINS, APS_DISTANCES),
 }
 
+RAPS_SAPS_LAMBDAS = {
+    'cifar10': {
+        0.001: {'raps': 0.001, 'saps': 0.008},
+        None: {'raps': 0.1, 'saps': 0.2},
+    },
+    'cifar100': {
+        0.001: {'raps': 0.01, 'saps': 0.08},
+        None: {'raps': 0.1, 'saps': 0.2},
+    },
+    'imagenet': {
+        0.001: {'raps': 0.001, 'saps': 0.04},
+        None: {'raps': 0.01, 'saps': 0.1},
+    },
+}
+RAPS_SAPS_U_VALUES = (0.001, None)
+
 
 # Columns identifying one experimental configuration (a re-run replaces its rows).
 CONFIG_KEYS = ['dataset', 'model_architecture', 'domain', 'score_function',
-               'distance_metric', 'mondrian', 'reg_k', 'reg_lambda']
-
+               'distance_metric', 'mondrian', 'reg_k', 'reg_lambda', 'u']
 
 def breakpoint_values(top1_accuracy):
     e = 1.0 - float(top1_accuracy)
@@ -121,8 +139,15 @@ class ConformalConfig:
             temperature_tag = str(temperature).replace('.', '_')
 
         if self.uses_temperature_variants:
-            output_suffix = '_T_' + temperature_tag
-            self.n_calib = 30000 if temperature_tag == 'calibrated' else 40000
+            if temperature_tag == 'calibrated':
+                output_suffix = '_T_calibrated'
+                self.n_calib = 30000
+            elif temperature == 1.0:
+                output_suffix = ''  # T=1 is the plain outputs file
+                self.n_calib = 40000
+            else:
+                output_suffix = '_T_' + temperature_tag
+                self.n_calib = 40000
         else:
             if temperature_tag != '1_0':
                 raise ValueError("Temperature options other than 1.0 apply only to ImageNet ResNet50")
@@ -131,45 +156,15 @@ class ConformalConfig:
         is_imbalanced = self.simulate_class_imbalance
         output_suffix += '_imbalanced' if is_imbalanced else ''
 
-        # Load static data once (npz is lazy; arrays are read on first use)
         output_stem = self.dataset + '_' + self.model_architecture
-        non_imbalance_suffix = output_suffix[:-len('_imbalanced')] if output_suffix.endswith('_imbalanced') else output_suffix
-        balanced_outputs_path = os.path.join(
-            self.evaluation_dir, output_stem + '_outputs' + non_imbalance_suffix + '.npz'
-        )
-        balanced_metrics_path = os.path.join(
-            self.evaluation_dir, output_stem + '_metrics' + non_imbalance_suffix + '.npz'
-        )
-        imbalanced_outputs_path = os.path.join(
-            self.evaluation_dir, output_stem + '_outputs' + non_imbalance_suffix + '_imbalanced.npz'
-        )
-        imbalanced_metrics_path = os.path.join(
-            self.evaluation_dir, output_stem + '_metrics' + non_imbalance_suffix + '_imbalanced.npz'
-        )
-
-        outputs_path = balanced_outputs_path if not is_imbalanced else imbalanced_outputs_path
-        metrics_path = balanced_metrics_path if not is_imbalanced else imbalanced_metrics_path
-
-        mismatch_ok = False
-        if is_imbalanced:
-            mismatch_ok = ((not os.path.exists(outputs_path) or not os.path.exists(metrics_path))
-                           and os.path.exists(balanced_outputs_path) and os.path.exists(balanced_metrics_path))
-        else:
-            mismatch_ok = ((not os.path.exists(outputs_path) or not os.path.exists(metrics_path))
-                           and os.path.exists(imbalanced_outputs_path) and os.path.exists(imbalanced_metrics_path))
-        if mismatch_ok:
-            raise FileNotFoundError(
-                "Requested imbalance configuration does not match the available evaluation files. "
-                f"Expected {outputs_path} and {metrics_path}, but the opposite artifact set exists instead: "
-                f"{balanced_outputs_path}/{balanced_metrics_path} vs {imbalanced_outputs_path}/{imbalanced_metrics_path}. "
-                "Set config['evaluation']['simulate_class_imbalance'] to match the file suffix on disk."
-            )
-        if not os.path.exists(outputs_path) or not os.path.exists(metrics_path):
-            raise FileNotFoundError(
-                "Temperature-specific output/metrics NPZs are missing: %s and %s. "
-                "Run model_eval_and_save_features.py first."
-                % (outputs_path, metrics_path)
-            )
+        outputs_path = os.path.join(self.evaluation_dir, output_stem + '_outputs' + output_suffix + '.npz')
+        metrics_path = os.path.join(self.evaluation_dir, output_stem + '_metrics' + output_suffix + '.npz')
+        for path in (outputs_path, metrics_path):
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    path + " is missing. Run model_eval_and_save_features.py first and check that "
+                    "simulate_class_imbalance matches the evaluated model."
+                )
         self.data = np.load(outputs_path)
         self._arrays_cache = {}
 
@@ -219,14 +214,15 @@ class ConformalConfig:
         """
         Create a random calibration/test split from a dict of plain numpy arrays.
 
-        If `simulate_class_imbalance` is enabled, the ordinary calibration/test
-        partition is created first. Calibration can then subsample minority-class
-        examples within its fixed partition; the test indices remain unchanged.
+        If `simulate_class_imbalance` is enabled, calibration can subsample
+        minority-class examples; the test indices remain unchanged. A positive
+        fraction of each minority class is retained from the calibration pool.
         """
         labels = data_arrays['labels']
 
         rng = np.random.RandomState(random_seed)
         indices = rng.permutation(len(labels))
+
         calibration_pool_idx = indices[:n_calib]
         test_idx = indices[n_calib:]
 
@@ -286,19 +282,9 @@ class ConformalConfig:
         dict. Reads the current attribute values, so mutating
         conf.score_function / conf.distance_metric between calls works.
         """
-        data_arrays = self._needed_arrays()
-        minority_class_ids = (
-            self._minority_class_ids(
-                data_arrays['labels'],
-                self.minority_class_fraction,
-                self.imbalance_seed,
-                classes=np.arange(data_arrays['probabilities'].shape[1]),
-            )
-            if self.simulate_class_imbalance else set()
-        )
         return {
             'alpha': self.alpha,
-            'data_arrays': data_arrays,
+            'data_arrays': self._needed_arrays(),
             'n_classes': self.n_classes,
             'distance_metric': self.distance_metric,
             'score_function': self.score_function,
@@ -316,7 +302,6 @@ class ConformalConfig:
             'minority_class_fraction': self.minority_class_fraction,
             'calibration_minority_fraction': self.calibration_minority_fraction,
             'imbalance_seed': self.imbalance_seed,
-            'minority_class_ids': minority_class_ids,
         }
 
 
@@ -326,37 +311,11 @@ def run_parallel_iterations(conf, worker_fn, n_iterations, desc):
     range(n_iterations), in parallel across conf.n_workers processes.
     """
     conf_data = conf.to_worker_dict()
+
     return joblib.Parallel(n_jobs=conf.n_workers)(
         joblib.delayed(worker_fn)(random_seed, conf_data)
         for random_seed in range(n_iterations)
     )
-
-
-def run_cp_once(alpha, calibration_data, calibration_labels, calibration_preds, test_data, test_labels,
-                n_classes, distance_metric, score_function, mondrian, reg_k, reg_lambda,
-                model_architecture, dataset, u=0.001, random_state=None):
-
-    cp = ConformalPrediction(
-        alpha=alpha,
-        calibration_data=calibration_data,
-        calibration_labels=calibration_labels,
-        calibration_preds=calibration_preds,
-        test_data=test_data,
-        test_labels=test_labels,
-        n_classes=n_classes,
-        distance_metric=distance_metric,
-        score_function=score_function,
-        mondrian=mondrian,
-        reg_k=reg_k,
-        reg_lambda=reg_lambda,
-        u=u,
-        random_state=random_state,
-        model_architecture=model_architecture,
-        dataset=dataset
-    )
-    cp.compute_scores()
-
-    return cp.predict_with_scores(alpha=alpha)
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +343,14 @@ def cumulative_S(cp, breakpoints, chunk_size=2000):
     F = {name: total / n_test for name, total in totals.items()}
     F['0'] = 0.0
     return F
+
+
+def _overall_coverage(cp, test_labels, alpha):
+    """Return the fraction of true labels included in the alpha prediction sets."""
+    labels = np.asarray(test_labels, dtype=int)
+    thresholds = np.asarray(cp._thresholds_for_alpha(alpha), dtype=float)
+    test_rows = np.arange(len(labels))
+    return float(np.mean(cp._test_scores[test_rows, labels] <= thresholds[labels]))
 
 
 def find_S_single_iteration(alpha, calibration_data, calibration_labels, calibration_preds,
@@ -418,7 +385,9 @@ def find_S_single_iteration(alpha, calibration_data, calibration_labels, calibra
     cp.compute_scores()
 
     F = cumulative_S(cp, breakpoint_values(top1_accuracy))
-    return {lo + '-' + hi: F[hi] - F[lo] for lo, hi in WINDOWS}
+    result = {lo + '-' + hi: F[hi] - F[lo] for lo, hi in WINDOWS}
+    result['coverage'] = _overall_coverage(cp, test_labels, alpha)
+    return result
 
 
 def compute_iteration(random_seed, conf_data):
@@ -428,10 +397,10 @@ def compute_iteration(random_seed, conf_data):
         conf_data['data_arrays'],
         conf_data['n_calib'],
         conf_data['conformal_domain'],
-        simulate_class_imbalance=conf_data.get('simulate_class_imbalance', False),
-        minority_class_fraction=conf_data.get('minority_class_fraction', 0.10),
-        calibration_minority_fraction=conf_data.get('calibration_minority_fraction', 1.0),
-        imbalance_seed=conf_data.get('imbalance_seed', 123),
+        simulate_class_imbalance=conf_data['simulate_class_imbalance'],
+        minority_class_fraction=conf_data['minority_class_fraction'],
+        calibration_minority_fraction=conf_data['calibration_minority_fraction'],
+        imbalance_seed=conf_data['imbalance_seed'],
     )
 
     return find_S_single_iteration(
@@ -450,7 +419,7 @@ def compute_iteration(random_seed, conf_data):
         conf_data['top1_accuracy'],
         model_architecture=conf_data['model_architecture'],
         dataset=conf_data['dataset'],
-        u=conf_data.get('u', 0.001),
+        u=conf_data['u'],
         random_state=random_seed,
     )
 
@@ -468,11 +437,28 @@ def summarise(values):
     }
 
 
+def summarise_coverage(values, alpha=None):
+    """Summarize overall prediction coverage across split redraws."""
+    values = np.asarray(values, dtype=float)
+    q1, median, q3 = np.percentile(values, [25, 50, 75])
+    summary = {
+        'coverage_median': median,
+        'coverage_mean': values.mean(),
+        'coverage_min': values.min(),
+        'coverage_max': values.max(),
+        'coverage_q1': q1,
+        'coverage_q3': q3,
+    }
+    if alpha is not None:
+        summary['alpha'] = float(alpha)
+    return summary
+
+
 # ---------------------------------------------------------------------------
 # S_table bookkeeping
 # ---------------------------------------------------------------------------
 # A "spec" is a dict with: dataset, model_architecture, conformal_domain,
-# score_function, distance_metric, mondrian, reg_k, reg_lambda.
+# score_function, distance_metric, mondrian, reg_k, reg_lambda, alpha, u.
 
 def spec_from_conf(conf):
     return {
@@ -484,7 +470,13 @@ def spec_from_conf(conf):
         'mondrian': conf.mondrian,
         'reg_k': conf.reg_k,
         'reg_lambda': conf.reg_lambda,
+        'alpha': conf.alpha,
+        'u': conf.u,
     }
+
+
+def describe_u(u):
+    return 'Random' if u is None else str(float(u))
 
 
 def table_key(spec):
@@ -503,12 +495,15 @@ def table_key(spec):
         'mondrian': bool(spec['mondrian']),
         'reg_k': float(spec['reg_k']) if score == 'raps' else -1.0,
         'reg_lambda': float(spec['reg_lambda']) if score in ('raps', 'saps') else -1.0,
+        'u': np.nan if spec['u'] is None else float(spec['u']),
     }
 
 
 def describe(spec):
     return (spec['dataset'] + ' ' + spec['model_architecture'] + ' ' + spec['conformal_domain'] + ' '
-            + spec['score_function'] + ' ' + spec['distance_metric'] + ' mondrian=' + str(spec['mondrian']))
+            + spec['score_function'] + ' ' + spec['distance_metric'] + ' mondrian=' + str(spec['mondrian'])
+            + ' reg_k=' + str(spec['reg_k']) + ' reg_lambda=' + str(spec['reg_lambda'])
+            + ' U=' + describe_u(spec['u']))
 
 
 def load_S_table(path):
@@ -519,10 +514,13 @@ def matching_mask(table, key):
     """Boolean mask of table rows belonging to the configuration `key`."""
     mask = np.ones(len(table), dtype=bool)
     for name, value in key.items():
-        if name not in table.columns:      # table from an older schema: no match
+        if name not in table.columns:
             return np.zeros(len(table), dtype=bool)
         column = table[name]
-        if name in ('reg_k', 'reg_lambda'):
+        if name in ('reg_k', 'reg_lambda', 'u'):
+            if pd.isna(value):
+                mask &= column.isna().to_numpy()
+                continue
             mask &= np.isclose(column.astype(float).to_numpy(), value)
         else:
             mask &= (column == value).to_numpy()
@@ -550,16 +548,28 @@ def update_S_table(path, key, new_df):
     os.replace(tmp_path, path)
 
 
-def add_row_to_S_table(n_iterations, conf=None):
+def write_S_table_views(path):
+    """Write the 0-e summary CSV beside the full resumable S_table.csv."""
+    table = load_S_table(path)
+    if table is None:
+        return
+
+    output_dir = os.path.dirname(path)
+    summary_path = os.path.join(output_dir, 'S_table_0-e.csv')
+    summary = table.loc[table['window'] == '0-e'].copy()
+    tmp_path = summary_path + '.tmp'
+    summary.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, summary_path)
+
+
+def add_row_to_S_table(n_iterations, conf):
     """
     Compute truncated S over `n_iterations` calibration/test redraws and write
     one row per window into figures/S_table.csv (replacing any earlier rows for
-    the same configuration). With conf=None the settings come from config.yaml.
+    the same configuration).
     Returns (window_labels, S_matrix), S_matrix of shape (n_iterations, n_windows).
     Row i used seed i for every config, so matrices from different configs are paired.
     """
-    if conf is None:
-        conf = ConformalConfig()
     spec = spec_from_conf(conf)
     key = table_key(spec)
 
@@ -570,6 +580,8 @@ def add_row_to_S_table(n_iterations, conf=None):
     computation_time_seconds = time.perf_counter() - computation_start
 
     S_matrix = np.array([[r[label] for label in WINDOW_LABELS] for r in results])
+    coverage_values = np.asarray([result['coverage'] for result in results], dtype=float)
+    coverage_summary = summarise_coverage(coverage_values, alpha=conf.alpha)
 
     # Raw per-redraw values (columns follow WINDOW_LABELS), for paired comparisons later.
     raw_dir = os.path.join(conf.evaluation_dir, 'figures', 'S_raw')
@@ -589,13 +601,15 @@ def add_row_to_S_table(n_iterations, conf=None):
              upper=bp[hi],
              n_iterations=n_iterations,
              computation_time_seconds=computation_time_seconds,
-             **summarise(S_per_unit_window[:, j]))
+             **summarise(S_per_unit_window[:, j]),
+             **coverage_summary)
         for j, (lo, hi) in enumerate(WINDOWS)
     ])
 
     S_table_path = os.path.join(conf.evaluation_dir, 'figures', 'S_table.csv')
     os.makedirs(os.path.dirname(S_table_path), exist_ok=True)
     update_S_table(S_table_path, key, new_df)
+    write_S_table_views(S_table_path)
 
     full = new_df.loc[new_df['window'] == '0-1', 'S_median'].item()
     i1_row = new_df.loc[new_df['window'] == '0-e'].iloc[0]
@@ -610,8 +624,13 @@ def add_row_to_S_table(n_iterations, conf=None):
 # Sweep over all configurations (resumable)
 # ---------------------------------------------------------------------------
 
-def build_plan(reg_k, reg_lambda):
-    """All configurations to run, ordered so that consecutive specs share (dataset, model, domain)."""
+def build_plan(reg_k, reg_lambda, default_u=0.001):
+    """Build the active configuration grid from SCORE_SPECS only.
+
+    The selected standard RAPS/SAPS lambda values are included for both fixed
+    and randomized U. The broader regularization sweeps live separately in
+    raps_saps_sweep.py.
+    """
     plan = []
     for dataset in DATASETS:
         for model in MODELS:
@@ -619,24 +638,42 @@ def build_plan(reg_k, reg_lambda):
                 for score, (domains, distances) in SCORE_SPECS.items():
                     if domain not in domains:
                         continue
+                    if score in ('raps', 'saps'):
+                        u_values = RAPS_SAPS_U_VALUES
+                    elif score == 'aps':
+                        u_values = tuple(dict.fromkeys((default_u, None)))
+                    else:
+                        u_values = (default_u,)
                     for distance in distances:
                         for mondrian in MONDRIAN_VALUES:
-                            plan.append({
-                                'dataset': dataset,
-                                'model_architecture': model,
-                                'conformal_domain': domain,
-                                'score_function': score,
-                                'distance_metric': distance,
-                                'mondrian': mondrian,
-                                'reg_k': reg_k,
-                                'reg_lambda': reg_lambda,
-                            })
+                            for u in u_values:
+                                reg_lambda_value = reg_lambda
+                                if score in ('raps', 'saps'):
+                                    try:
+                                        reg_lambda_value = RAPS_SAPS_LAMBDAS[dataset][u][score]
+                                    except KeyError as error:
+                                        raise ValueError(
+                                            f"Missing RAPS/SAPS lambda for dataset={dataset}, U={u}, score={score}"
+                                        ) from error
+                                plan.append({
+                                    'dataset': dataset,
+                                    'model_architecture': model,
+                                    'conformal_domain': domain,
+                                    'score_function': score,
+                                    'distance_metric': distance,
+                                    'mondrian': mondrian,
+                                    'reg_k': reg_k,
+                                    'reg_lambda': reg_lambda_value,
+                                    'u': u,
+                                })
     return plan
 
 
 def run_all(n_iterations=100, config_path="config.yaml", dry_run=False):
     """
-    Run every configuration in the grid that is not yet in S_table.csv.
+    Run every configuration in the grid that is not yet in S_table.csv, on the
+    balanced, T=1 evaluation artifacts (S_table has no imbalance or temperature column;
+    those experiments have their own scripts).
     Safe to restart: finished configurations are skipped, and the table is
     rewritten atomically after each one. dry_run=True only lists what is pending.
     """
@@ -645,7 +682,7 @@ def run_all(n_iterations=100, config_path="config.yaml", dry_run=False):
     cp_cfg = base['conformal_prediction']
     S_table_path = os.path.join(base['evaluation']['output_directory'], 'figures', 'S_table.csv')
 
-    plan = build_plan(cp_cfg['reg_k'], cp_cfg['reg_lambda'])
+    plan = build_plan(cp_cfg['reg_k'], cp_cfg['reg_lambda'], cp_cfg.get('u', 0.001))
     table = load_S_table(S_table_path)
     pending = [spec for spec in plan if not is_done(table, spec, n_iterations)]
 
@@ -673,6 +710,8 @@ def run_all(n_iterations=100, config_path="config.yaml", dry_run=False):
                     dataset=spec['dataset'],
                     model_architecture=spec['model_architecture'],
                     conformal_domain=spec['conformal_domain'],
+                    temperature=1.0,
+                    simulate_class_imbalance=False,
                 )
             except Exception as e:
                 print("FAILED to load %s: %s" % (group, repr(e)), flush=True)
@@ -686,6 +725,7 @@ def run_all(n_iterations=100, config_path="config.yaml", dry_run=False):
         conf.mondrian = spec['mondrian']
         conf.reg_k = spec['reg_k']
         conf.reg_lambda = spec['reg_lambda']
+        conf.u = spec['u']
 
         print("[%d/%d] %s" % (i, len(pending), describe(spec)), flush=True)
         try:
@@ -698,67 +738,6 @@ def run_all(n_iterations=100, config_path="config.yaml", dry_run=False):
     print("Finished: %d computed, %d failed" % (n_done, len(failures)), flush=True)
     for name, reason in failures:
         print("  failed: %s -> %s" % (name, reason))
-
-
-def compute_prevalence_iteration(random_seed, conf_data):
-    """Worker: compute minority-class prevalence for one calibration/test split."""
-    split = ConformalConfig.make_split(
-        random_seed,
-        conf_data['data_arrays'],
-        conf_data['n_calib'],
-        conf_data['conformal_domain'],
-        simulate_class_imbalance=conf_data.get('simulate_class_imbalance', False),
-        minority_class_fraction=conf_data.get('minority_class_fraction', 0.10),
-        calibration_minority_fraction=conf_data.get('calibration_minority_fraction', 1.0),
-        imbalance_seed=conf_data.get('imbalance_seed', 123),
-    )
-
-    results_df = run_cp_once(
-        conf_data['alpha'],
-        split['calibration_data'],
-        split['calibration_labels'],
-        split['calibration_preds'],
-        split['test_data'],
-        split['test_labels'],
-        conf_data['n_classes'],
-        conf_data['distance_metric'],
-        conf_data['score_function'],
-        conf_data['mondrian'],
-        conf_data['reg_k'],
-        conf_data['reg_lambda'],
-        model_architecture=conf_data['model_architecture'],
-        dataset=conf_data['dataset'],
-        u=conf_data.get('u', 0.001),
-        random_state=random_seed,
-    )
-
-    evaluator = ConformalPredictionEvaluator(
-        results_df,
-        conf_data['score_function'],
-        conf_data['distance_metric'],
-        conf_data['alpha'],
-        conf_data['mondrian'],
-        conf_data['n_classes']
-    )
-
-    return evaluator.prevalence_of_minority_classes(
-        conf_data.get('minority_class_ids', set())
-    )
-
-
-def compute_prevalence_of_minority_classes(n_iterations):
-    conf = ConformalConfig()
-
-    results = run_parallel_iterations(
-        conf, compute_prevalence_iteration, n_iterations,
-        desc="Computing prevalence of minority classes"
-    )
-
-    true_proportions, expected_proportions = zip(*results)
-    median_true_proportion = np.median(true_proportions)
-    median_expected_proportion = np.median(expected_proportions)
-
-    return median_true_proportion, median_expected_proportion
 
 
 class ConformalPredictionEvaluator():
@@ -830,117 +809,7 @@ class ConformalPredictionEvaluator():
 
             return overall_accuracy, overall_avg_size
 
-    def prevalence_of_minority_classes(self, minority_classes):
-        """Compare prediction-region prevalence for the configured minority classes.
-
-        Minority class identities come from the seeded imbalance configuration,
-        not from observed label frequencies, which may vary with the calibration
-        sampling fraction.
-        """
-        minority_classes = set(minority_classes)
-        print(f"Evaluating prevalence of minority classes: {minority_classes}")
-        if not minority_classes or self.results_df.empty:
-            return 0.0, 0.0
-
-        labels = self.results_df['label'].to_numpy()
-        prediction_regions = self.results_df['prediction_region'].tolist()
-        n_regions = len(prediction_regions)
-
-        # Single pass over all prediction regions, tallying how many times
-        # each class appears anywhere in a region. Previously this rescanned
-        # the full list of prediction regions once per minority class
-        # (O(minority_classes * n_regions)); this does it in one pass
-        # (O(n_regions)) and just looks up the counts we need afterward.
-        class_region_counts = Counter()
-        for region in prediction_regions:
-            class_region_counts.update(region)
-
-        true_proportions = []
-        expected_proportions = []
-        for minority_class in minority_classes:
-            expected_proportions.append(np.mean(labels == minority_class))
-            true_proportions.append(class_region_counts.get(minority_class, 0) / n_regions)
-
-        return float(np.mean(true_proportions)), float(np.mean(expected_proportions))
-
-    def _pvalue_matrix(self):
-        return self.results_df[[f'pvalue_class_{c}' for c in range(self.n_classes)]].to_numpy()
-
-    def vovk_s_criterion(self):
-        p = self._pvalue_matrix()
-        s_values = p.sum(axis=1)
-        return {'s_per_example': s_values, 's_mean': s_values.mean()}
-
-    def window_S(self, lower, upper, normalize=False):
-        """
-        Raw integral of mean |P(alpha)| over [lower, upper] (= truncated S).
-        normalize=True divides by (upper - lower), giving the mean set size over the window.
-        """
-        integral = (np.clip(self._pvalue_matrix(), lower, upper) - lower).sum(axis=1).mean()
-        return integral / (upper - lower) if normalize else integral
-
-    def i1_closed_form(self, upper, lower):
-        """
-        Integral of mean |P(alpha)| over [lower, upper], divided by `upper`
-        (this matches the old trapezoid loop, which divided by 1 - accuracy).
-        For lower = 0 this equals the mean set size over (0, upper).
-        """
-        integral = (np.clip(self._pvalue_matrix(), lower, upper) - lower).sum(axis=1).mean()
-        return integral / upper
-
-    def truncated_S_curve(self, P, U_grid):
-        """Return S(U) over ``U_grid``; plotting is handled by the caller."""
-        P = np.asarray(P)
-        U_grid = np.asarray(U_grid)
-        return np.array([np.minimum(P, U).sum(axis=1).mean() for U in U_grid])
-
-
 
 if __name__ == "__main__":
 
-    # Do a quick minority-class prevalence check to verify that the imbalance simulation is working as expected.
-    # n_iterations = 100
-    # median_true_proportion, median_expected_proportion = compute_prevalence_of_minority_classes(n_iterations)
-    # print(f"Median true proportion of minority classes in prediction regions: {median_true_proportion:.4f}")
-    # print(f"Median expected proportion of minority classes in the dataset: {median_expected_proportion:.4f}")
-
-    # Run CP once
-    conf = ConformalConfig()
-    split = conf.create_split(random_seed=42)
-    results_df = run_cp_once(
-        conf.alpha,
-        split['calibration_data'],
-        split['calibration_labels'],
-        split['calibration_preds'],
-        split['test_data'],
-        split['test_labels'],
-        conf.n_classes,
-        conf.distance_metric,
-        conf.score_function,
-        conf.mondrian,
-        conf.reg_k,
-        conf.reg_lambda,
-        model_architecture=conf.model_architecture,
-        dataset=conf.dataset
-    )
-
-    evaluator = ConformalPredictionEvaluator(
-        results_df,
-        conf.score_function,
-        conf.distance_metric,
-        conf.alpha,
-        conf.mondrian,
-        conf.n_classes
-    )
-
-    # Get accuracy metrics
-    overall_accuracy, overall_avg_size = evaluator.get_accuracy(mondrian=conf.mondrian, print_acc=True)
-
-    true_proportions, expected_proportions = evaluator.prevalence_of_minority_classes(conf._minority_class_ids(
-        conf._needed_arrays()['labels'],
-        conf.minority_class_fraction,
-        conf.imbalance_seed,
-        classes=np.arange(conf._needed_arrays()['probabilities'].shape[1]),
-    ))
-    print(f"Median true proportion of minority classes in prediction regions: {true_proportions:.4f}")
-    print(f"Median expected proportion of minority classes in the dataset: {expected_proportions:.4f}")
+    run_all(n_iterations=100, config_path="config.yaml", dry_run=False)
