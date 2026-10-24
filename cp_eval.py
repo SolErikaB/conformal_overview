@@ -4,6 +4,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import time
+from collections import Counter
 
 from conformal_prediction import ConformalPrediction
 
@@ -22,61 +23,12 @@ WINDOWS = [(BREAKPOINT_NAMES[i], BREAKPOINT_NAMES[j])
            for j in range(i + 1, len(BREAKPOINT_NAMES))]
 WINDOW_LABELS = [lo + '-' + hi for lo, hi in WINDOWS]
 
-# ---------------------------------------------------------------------------
-# Sweep grid for run_all().
-# ---------------------------------------------------------------------------
-DATASETS = ['cifar10', 'cifar100', 'imagenet']
-MODELS = ['resnet50', 'resnet18', 'efficientnet_b0', 'vit_b_16']
-
-DOMAINS = ['probabilities', 'logits', 'features']
-LABEL_DOMAINS = ['probabilities']
-MARGIN_DOMAINS = ['probabilities', 'logits']
-APS_DOMAINS = ['probabilities']
-GRADIENT_DOMAINS = ['features']
-
-DISTANCES = ['euclidean', 'cosine']
-APS_DISTANCES = ['euclidean']
-GRADIENT_DISTANCES = ['euclidean']
-
-MONDRIAN_VALUES = [False]
-
-SCORE_SPECS = {
-    'label':         (LABEL_DOMAINS, DISTANCES),
-    'mean':          (DOMAINS, DISTANCES),
-    'margin':        (MARGIN_DOMAINS, DISTANCES),
-    'gradient':      (GRADIENT_DOMAINS, GRADIENT_DISTANCES),
-    'fast_gradient': (GRADIENT_DOMAINS, GRADIENT_DISTANCES),
-    'aps':           (APS_DOMAINS, APS_DISTANCES),
-    'raps':          (APS_DOMAINS, APS_DISTANCES),
-    'saps':          (APS_DOMAINS, APS_DISTANCES),
-}
-
-RAPS_SAPS_LAMBDAS = {
-    'cifar10': {
-        0.001: {'raps': 0.001, 'saps': 0.008},
-        None: {'raps': 0.1, 'saps': 0.2},
-    },
-    'cifar100': {
-        0.001: {'raps': 0.01, 'saps': 0.08},
-        None: {'raps': 0.1, 'saps': 0.2},
-    },
-    'imagenet': {
-        0.001: {'raps': 0.001, 'saps': 0.04},
-        None: {'raps': 0.01, 'saps': 0.1},
-    },
-}
-RAPS_SAPS_U_VALUES = (0.001, None)
-
-
-# Columns identifying one experimental configuration (a re-run replaces its rows).
-CONFIG_KEYS = ['dataset', 'model_architecture', 'domain', 'score_function',
-               'distance_metric', 'mondrian', 'reg_k', 'reg_lambda', 'u']
-
 def breakpoint_values(top1_accuracy):
     e = 1.0 - float(top1_accuracy)
     if not 0.0 < e < 1.0:
         raise ValueError("1 - top1_accuracy must be in (0, 1), got " + str(e))
     return dict(zip(BREAKPOINT_NAMES, [0, e / 4, e / 2, e, 1.0]))
+
 
 class ConformalConfig:
     """
@@ -210,13 +162,15 @@ class ConformalConfig:
     @staticmethod
     def make_split(random_seed, data_arrays, n_calib, conformal_domain,
                    simulate_class_imbalance=False, minority_class_fraction=0.10,
-                   calibration_minority_fraction=1.0, imbalance_seed=123):
+                   calibration_minority_fraction=1.0, imbalance_seed=123,
+                   calibration_retention="round"):
         """
         Create a random calibration/test split from a dict of plain numpy arrays.
 
         If `simulate_class_imbalance` is enabled, calibration can subsample
-        minority-class examples; the test indices remain unchanged. A positive
-        fraction of each minority class is retained from the calibration pool.
+        minority-class examples; the test indices remain unchanged. The standard
+        retention mode rounds the requested fraction; `floor_min_one` is available
+        for analyses that define retention as a truncated count with a minimum of one.
         """
         labels = data_arrays['labels']
 
@@ -239,8 +193,18 @@ class ConformalConfig:
 
             for minority_class in minority_classes:
                 class_positions = np.flatnonzero(calib_labels == minority_class)
-                n_keep = int(round(calibration_minority_fraction * len(class_positions)))
-                n_keep = min(len(class_positions), max(0, n_keep))
+                if calibration_retention == "round":
+                    n_keep = min(len(class_positions), max(0, int(round(
+                        calibration_minority_fraction * len(class_positions)
+                    ))))
+                elif calibration_retention == "floor_min_one":
+                    n_keep = min(len(class_positions), int(
+                        calibration_minority_fraction * len(class_positions)
+                    ))
+                    if calibration_minority_fraction > 0:
+                        n_keep = max(1, n_keep)
+                else:
+                    raise ValueError(f"Unsupported calibration_retention: {calibration_retention}")
                 keep_mask[class_positions] = False
                 if n_keep:
                     selected_positions = rng.choice(class_positions, size=n_keep, replace=False)
@@ -259,9 +223,12 @@ class ConformalConfig:
             'calibration_preds': probs[cal_idx].argmax(axis=1),
             'test_data': domain[test_idx],
             'test_labels': labels[test_idx],
+            'calibration_pool_idx': calibration_pool_idx,
+            'calibration_idx': cal_idx,
+            'test_idx': test_idx,
         }
 
-    def create_split(self, random_seed):
+    def create_split(self, random_seed, calibration_retention="round"):
         """Create a random calibration/test split using this config's own data"""
         return self.make_split(
             random_seed,
@@ -272,6 +239,7 @@ class ConformalConfig:
             minority_class_fraction=self.minority_class_fraction,
             calibration_minority_fraction=self.calibration_minority_fraction,
             imbalance_seed=self.imbalance_seed,
+            calibration_retention=calibration_retention,
         )
 
     # ---- Worker payload ------------------------------------------------
@@ -586,7 +554,11 @@ def add_row_to_S_table(n_iterations, conf):
     # Raw per-redraw values (columns follow WINDOW_LABELS), for paired comparisons later.
     raw_dir = os.path.join(conf.evaluation_dir, 'figures', 'S_raw')
     os.makedirs(raw_dir, exist_ok=True)
-    tag = '_'.join([str(key[name]) for name in CONFIG_KEYS])
+    raw_key_columns = (
+        'dataset', 'model_architecture', 'domain', 'score_function',
+        'distance_metric', 'mondrian', 'reg_k', 'reg_lambda', 'u',
+    )
+    tag = '_'.join([str(key[name]) for name in raw_key_columns])
     np.save(os.path.join(raw_dir, tag + '.npy'), S_matrix)
 
     bp = breakpoint_values(conf.top1_accuracy)
@@ -618,126 +590,6 @@ def add_row_to_S_table(n_iterations, conf):
     print("Computation time: %.3f seconds" % computation_time_seconds, flush=True)
 
     return WINDOW_LABELS, S_matrix
-
-
-# ---------------------------------------------------------------------------
-# Sweep over all configurations (resumable)
-# ---------------------------------------------------------------------------
-
-def build_plan(reg_k, reg_lambda, default_u=0.001):
-    """Build the active configuration grid from SCORE_SPECS only.
-
-    The selected standard RAPS/SAPS lambda values are included for both fixed
-    and randomized U. The broader regularization sweeps live separately in
-    raps_saps_sweep.py.
-    """
-    plan = []
-    for dataset in DATASETS:
-        for model in MODELS:
-            for domain in DOMAINS:
-                for score, (domains, distances) in SCORE_SPECS.items():
-                    if domain not in domains:
-                        continue
-                    if score in ('raps', 'saps'):
-                        u_values = RAPS_SAPS_U_VALUES
-                    elif score == 'aps':
-                        u_values = tuple(dict.fromkeys((default_u, None)))
-                    else:
-                        u_values = (default_u,)
-                    for distance in distances:
-                        for mondrian in MONDRIAN_VALUES:
-                            for u in u_values:
-                                reg_lambda_value = reg_lambda
-                                if score in ('raps', 'saps'):
-                                    try:
-                                        reg_lambda_value = RAPS_SAPS_LAMBDAS[dataset][u][score]
-                                    except KeyError as error:
-                                        raise ValueError(
-                                            f"Missing RAPS/SAPS lambda for dataset={dataset}, U={u}, score={score}"
-                                        ) from error
-                                plan.append({
-                                    'dataset': dataset,
-                                    'model_architecture': model,
-                                    'conformal_domain': domain,
-                                    'score_function': score,
-                                    'distance_metric': distance,
-                                    'mondrian': mondrian,
-                                    'reg_k': reg_k,
-                                    'reg_lambda': reg_lambda_value,
-                                    'u': u,
-                                })
-    return plan
-
-
-def run_all(n_iterations=100, config_path="config.yaml", dry_run=False):
-    """
-    Run every configuration in the grid that is not yet in S_table.csv, on the
-    balanced, T=1 evaluation artifacts (S_table has no imbalance or temperature column;
-    those experiments have their own scripts).
-    Safe to restart: finished configurations are skipped, and the table is
-    rewritten atomically after each one. dry_run=True only lists what is pending.
-    """
-    with open(config_path, 'r') as f:
-        base = yaml.safe_load(f)
-    cp_cfg = base['conformal_prediction']
-    S_table_path = os.path.join(base['evaluation']['output_directory'], 'figures', 'S_table.csv')
-
-    plan = build_plan(cp_cfg['reg_k'], cp_cfg['reg_lambda'], cp_cfg.get('u', 0.001))
-    table = load_S_table(S_table_path)
-    pending = [spec for spec in plan if not is_done(table, spec, n_iterations)]
-
-    print("%d configurations planned, %d already in S_table, %d to run"
-          % (len(plan), len(plan) - len(pending), len(pending)), flush=True)
-
-    if dry_run:
-        for spec in pending:
-            print("  todo: " + describe(spec))
-        return
-
-    failures = []
-    conf = None
-    current_group = None
-    n_done = 0
-
-    for i, spec in enumerate(pending, 1):
-        group = (spec['dataset'], spec['model_architecture'], spec['conformal_domain'])
-        if group != current_group:
-            conf = None      # release the previous group's arrays before loading the next
-            current_group = group
-            try:
-                conf = ConformalConfig(
-                    config_path,
-                    dataset=spec['dataset'],
-                    model_architecture=spec['model_architecture'],
-                    conformal_domain=spec['conformal_domain'],
-                    temperature=1.0,
-                    simulate_class_imbalance=False,
-                )
-            except Exception as e:
-                print("FAILED to load %s: %s" % (group, repr(e)), flush=True)
-
-        if conf is None:
-            failures.append((describe(spec), 'could not load data'))
-            continue
-
-        conf.score_function = spec['score_function']
-        conf.distance_metric = spec['distance_metric']
-        conf.mondrian = spec['mondrian']
-        conf.reg_k = spec['reg_k']
-        conf.reg_lambda = spec['reg_lambda']
-        conf.u = spec['u']
-
-        print("[%d/%d] %s" % (i, len(pending), describe(spec)), flush=True)
-        try:
-            add_row_to_S_table(n_iterations, conf=conf)
-            n_done += 1
-        except Exception as e:
-            print("FAILED: %s: %s" % (describe(spec), repr(e)), flush=True)
-            failures.append((describe(spec), repr(e)))
-
-    print("Finished: %d computed, %d failed" % (n_done, len(failures)), flush=True)
-    for name, reason in failures:
-        print("  failed: %s -> %s" % (name, reason))
 
 
 class ConformalPredictionEvaluator():
@@ -809,7 +661,3 @@ class ConformalPredictionEvaluator():
 
             return overall_accuracy, overall_avg_size
 
-
-if __name__ == "__main__":
-
-    run_all(n_iterations=100, config_path="config.yaml", dry_run=False)
