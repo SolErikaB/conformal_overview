@@ -87,6 +87,13 @@ def main():
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
     parser.add_argument("--architectures", nargs="+", choices=ARCHITECTURES, default=list(ARCHITECTURES))
+    parser.add_argument(
+        "--imbalance-modes",
+        nargs="+",
+        choices=("balanced", "imbalanced"),
+        default=("balanced", "imbalanced"),
+        help="Which evaluation/training modes to run (default: both).",
+    )
     parser.add_argument("--force", action="store_true", help="Retrain and reevaluate even if artifacts exist.")
     args = parser.parse_args()
 
@@ -105,7 +112,7 @@ def main():
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
 
-    imbalance_modes = (False, True)
+    imbalance_modes = tuple(mode == "imbalanced" for mode in args.imbalance_modes)
     run_count = len(args.datasets) * len(args.architectures) * len(imbalance_modes)
     failures = []
     run_number = 0
